@@ -1,3 +1,9 @@
 [submodule "FEMU/base"]
 	path = FEMU/base
 	url = git@github.com:vtess/FEMU.git
+[submodule "Softwares/FIO/base"]
+	path = Softwares/FIO/base
+	url = git@github.com:axboe/fio.git
+[submodule "Softwares/RocksDB/base"]
+	path = Softwares/RocksDB/base
+	url = git@github.com:facebook/rocksdb.git
