@@ -1,0 +1,658 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a5ced51fc..fa4a8c769 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -826,6 +826,7 @@ set(SOURCES
+         util/crc32c.cc
+         util/dynamic_bloom.cc
+         util/hash.cc
++        util/latest-generator.cc
+         util/murmurhash.cc
+         util/random.cc
+         util/rate_limiter.cc
+@@ -837,6 +838,7 @@ set(SOURCES
+         util/thread_local.cc
+         util/threadpool_imp.cc
+         util/xxhash.cc
++        util/zipf.cc
+         utilities/backupable/backupable_db.cc
+         utilities/blob_db/blob_compaction_filter.cc
+         utilities/blob_db/blob_db.cc
+diff --git a/Makefile b/Makefile
+index e8e09588e..def46639c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -424,9 +424,9 @@ ifeq ($(PLATFORM), OS_OPENBSD)
+ 	WARNING_FLAGS += -Wno-unused-lambda-capture
+ endif
+ 
+-ifndef DISABLE_WARNING_AS_ERROR
+-	WARNING_FLAGS += -Werror
+-endif
++# ifndef DISABLE_WARNING_AS_ERROR
++# 	WARNING_FLAGS += -Werror
++# endif
+ 
+ 
+ ifdef LUA_PATH
+diff --git a/db/compaction/compaction_job.cc b/db/compaction/compaction_job.cc
+index a8e0bd596..4ad3dd30b 100644
+--- a/db/compaction/compaction_job.cc
++++ b/db/compaction/compaction_job.cc
+@@ -52,6 +52,7 @@
+ #include "port/port.h"
+ #include "rocksdb/db.h"
+ #include "rocksdb/env.h"
++#include "rocksdb/nvme_bg.h"
+ #include "rocksdb/sst_partitioner.h"
+ #include "rocksdb/statistics.h"
+ #include "rocksdb/status.h"
+@@ -1058,6 +1059,9 @@ void CompactionJob::ProcessKeyValueCompactionWithCompactionService(
+ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
+   assert(sub_compact);
+   assert(sub_compact->compaction);
++  if (0 != sub_compact->compaction->start_level()) {
++    bg_set(COMPACTION_ID);
++  }
+ 
+ #ifndef ROCKSDB_LITE
+   if (db_options_.compaction_service) {
+@@ -1418,6 +1422,9 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
+   clip.reset();
+   raw_input.reset();
+   sub_compact->status = status;
++  if (0 != sub_compact->compaction->start_level()) {
++    bg_unset();
++  }
+ }
+ 
+ void CompactionJob::RecordDroppedKeys(
+diff --git a/include/rocksdb/nvme_bg.h b/include/rocksdb/nvme_bg.h
+new file mode 100644
+index 000000000..de9ccf75d
+--- /dev/null
++++ b/include/rocksdb/nvme_bg.h
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-3.0
++/*
++ * nvme_bg.h -- nvme_bg export API to user
++ *
++ * Copyright 2021, Yu Wang
++ */
++
++#ifndef _NVME_BG_H
++#define _NVME_BG_H
++
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#define __NR_nvme_bg_setup	(436)
++#define BG_DESC_LEN		(64)
++#define WRITEBACK_ID		(1)
++#define FLUSH_ID		(2)
++#define COMPACTION_ID		(3)
++#define FIO_ID			(4)
++#define DEF_DEADLINE		(30e3)
++#define FLAGS_SHIFT		(16)
++
++enum NVME_BG_OP {
++	OP_REGISTER		= 0,
++	OP_DEREGISTER		= 1,
++	OP_CHANGE_QOS		= 2,
++	OP_SET_ID		= 3
++};
++
++enum NVME_BG_FLAG {
++	FLAG_QoS_BW		= 0,
++	FLAG_QoS_DDL		= 1,
++	FLAG_DEREGISTER		= 2
++};
++
++// ###############
++// # Private API #
++// ###############
++
++static inline long bg_set(unsigned int bg_id)
++{
++	return syscall(__NR_nvme_bg_setup, OP_SET_ID, bg_id, NULL, NULL);
++}
++
++static inline long bg_unset(void)
++{
++	return bg_set(0);
++}
++
++// ##############
++// # Public API #
++// ##############
++
++static inline long bg_register(unsigned int flags, unsigned int qos, char *desc,
++			       unsigned int *bg_id) {
++	unsigned int opcode_flags = OP_REGISTER | (flags << FLAGS_SHIFT);
++	return syscall(__NR_nvme_bg_setup, opcode_flags, qos, desc, bg_id);
++}
++
++static inline long bg_deregister(void)
++{
++	return syscall(__NR_nvme_bg_setup, OP_DEREGISTER, 0, NULL, NULL);
++}
++
++static inline long bg_change_qos(unsigned int flags, unsigned int qos)
++{
++	unsigned int opcode_flags = OP_CHANGE_QOS | (flags << FLAGS_SHIFT);
++	return syscall(__NR_nvme_bg_setup, opcode_flags, qos, NULL, NULL);
++}
++
++#endif /* _NVME_BG_H */
+diff --git a/monitoring/histogram.cc b/monitoring/histogram.cc
+index 03268b4a4..8e87257e5 100644
+--- a/monitoring/histogram.cc
++++ b/monitoring/histogram.cc
+@@ -193,9 +193,9 @@ std::string HistogramStat::ToString() const {
+   r.append(buf);
+   snprintf(buf, sizeof(buf),
+            "Percentiles: "
+-           "P50: %.2f P75: %.2f P99: %.2f P99.9: %.2f P99.99: %.2f\n",
+-           Percentile(50), Percentile(75), Percentile(99), Percentile(99.9),
+-           Percentile(99.99));
++           "P50: %.2f P75: %.2f P90: %.2f P99: %.2f P99.9: %.2f P99.99: %.2f\n",
++           Percentile(50), Percentile(75), Percentile(90), Percentile(99),
++           Percentile(99.9), Percentile(99.99));
+   r.append(buf);
+   r.append("------------------------------------------------------\n");
+   if (cur_num == 0) return r;   // all buckets are empty
+diff --git a/src.mk b/src.mk
+index b088e8b70..5d9ef816c 100644
+--- a/src.mk
++++ b/src.mk
+@@ -210,6 +210,7 @@ LIB_SOURCES =                                                   \
+   util/crc32c_arm64.cc                                          \
+   util/dynamic_bloom.cc                                         \
+   util/hash.cc                                                  \
++  util/latest-generator.cc                                      \
+   util/murmurhash.cc                                            \
+   util/random.cc                                                \
+   util/rate_limiter.cc                                          \
+@@ -221,6 +222,7 @@ LIB_SOURCES =                                                   \
+   util/thread_local.cc                                          \
+   util/threadpool_imp.cc                                        \
+   util/xxhash.cc                                                \
++  util/zipf.cc                                                  \
+   utilities/backupable/backupable_db.cc                         \
+   utilities/blob_db/blob_compaction_filter.cc                   \
+   utilities/blob_db/blob_db.cc                                  \
+diff --git a/tools/db_bench_tool.cc b/tools/db_bench_tool.cc
+index e39723dd6..2ace2e4c6 100644
+--- a/tools/db_bench_tool.cc
++++ b/tools/db_bench_tool.cc
+@@ -73,11 +73,13 @@
+ #include "util/compression.h"
+ #include "util/crc32c.h"
+ #include "util/gflags_compat.h"
++#include "util/latest-generator.h"
+ #include "util/mutexlock.h"
+ #include "util/random.h"
+ #include "util/stderr_logger.h"
+ #include "util/string_util.h"
+ #include "util/xxhash.h"
++#include "util/zipf.h"
+ #include "utilities/blob_db/blob_db.h"
+ #include "utilities/merge_operators.h"
+ #include "utilities/merge_operators/bytesxor.h"
+@@ -130,6 +132,9 @@ DEFINE_string(
+     "readwhilemerging,"
+     "readwhilescanning,"
+     "readrandomwriterandom,"
++    "ycsbwklda,"
++    "ycsbwkldb,"
++    "ycsbwkldf,"
+     "updaterandom,"
+     "xorupdaterandom,"
+     "approximatesizerandom,"
+@@ -1979,6 +1984,8 @@ class Stats {
+   uint64_t last_report_finish_;
+   std::unordered_map<OperationType, std::shared_ptr<HistogramImpl>,
+                      std::hash<unsigned char>> hist_;
++  std::shared_ptr<HistogramImpl> interval_read_hist_;
++  std::shared_ptr<HistogramImpl> interval_write_hist_;
+   std::string message_;
+   bool exclude_from_merge_;
+   ReporterAgent* reporter_agent_;  // does not own
+@@ -1996,6 +2003,8 @@ class Stats {
+     next_report_ = FLAGS_stats_interval ? FLAGS_stats_interval : 100;
+     last_op_finish_ = start_;
+     hist_.clear();
++    interval_read_hist_ = std::make_shared<HistogramImpl>();
++    interval_write_hist_ = std::make_shared<HistogramImpl>();
+     done_ = 0;
+     last_report_done_ = 0;
+     bytes_ = 0;
+@@ -2096,7 +2105,7 @@ class Stats {
+     }
+     if (FLAGS_histogram) {
+       uint64_t now = clock_->NowMicros();
+-      uint64_t micros = now - last_op_finish_;
++      uint64_t micros = now - last_op_finish_;  // 本次操作完成时间 - 上次完成时间
+ 
+       if (hist_.find(op_type) == hist_.end())
+       {
+@@ -2105,6 +2114,12 @@ class Stats {
+       }
+       hist_[op_type]->Add(micros);
+ 
++      if (op_type == kRead) {
++        interval_read_hist_->Add(micros);
++      } else if (op_type == kWrite) {
++        interval_write_hist_->Add(micros);
++      }
++
+       if (micros > 20000 && !FLAGS_stats_interval) {
+         fprintf(stderr, "long op: %" PRIu64 " micros%30s\r", micros, "");
+         fflush(stderr);
+@@ -2139,13 +2154,19 @@ class Stats {
+           fprintf(stderr,
+                   "%s ... thread %d: (%" PRIu64 ",%" PRIu64
+                   ") ops and "
+-                  "(%.1f,%.1f) ops/second in (%.6f,%.6f) seconds\n",
++                  "(%.1f,%.1f) ops/second in (%.6f,%.6f) seconds ... "
++                  "Read count %" PRIu64 ", avg (%.6f)us  ...  "
++                  "Write count %" PRIu64 ", avg (%.6f)us\n",
+                   clock_->TimeToString(now / 1000000).c_str(), id_,
+                   done_ - last_report_done_, done_,
+                   (done_ - last_report_done_) / (usecs_since_last / 1000000.0),
+                   done_ / ((now - start_) / 1000000.0),
+                   (now - last_report_finish_) / 1000000.0,
+-                  (now - start_) / 1000000.0);
++                  (now - start_) / 1000000.0,
++                  interval_read_hist_->num(), interval_read_hist_->Average(),
++                  interval_write_hist_->num(), interval_write_hist_->Average());
++          interval_read_hist_->Clear();
++          interval_write_hist_->Clear();
+ 
+           if (id_ == 0 && FLAGS_stats_per_interval) {
+             std::string stats;
+@@ -3238,6 +3259,12 @@ class Benchmark {
+         method = &Benchmark::ReadWhileScanning;
+       } else if (name == "readrandomwriterandom") {
+         method = &Benchmark::ReadRandomWriteRandom;
++      } else if (name == "ycsbwklda") {
++        method = &Benchmark::YCSBWorkloadA;
++      } else if (name == "ycsbwkldb") {
++        method = &Benchmark::YCSBWorkloadB;
++      } else if (name == "ycsbwkldf") {
++        method = &Benchmark::YCSBWorkloadF;
+       } else if (name == "readrandommergerandom") {
+         if (FLAGS_merge_operator.empty()) {
+           fprintf(stdout, "%-12s : skipped (--merge_operator is unknown)\n",
+@@ -6563,6 +6590,202 @@ class Benchmark {
+     thread->stats.AddMessage(msg);
+   }
+ 
++  // Workload A: Update heavy workload
++  // This workload has a mix of 50/50 reads and writes.
++  // An application example is a session store recording recent actions.
++  // Read/update ratio: 50/50
++  // Default data size: 1 KB records
++  // Request distribution: zipfian
++  void YCSBWorkloadA(ThreadState* thread) {
++    ReadOptions options(FLAGS_verify_checksum, true);
++    RandomGenerator gen;
++    std::string value;
++    int64_t found = 0;
++    int64_t reads_done = 0;
++    int64_t writes_done = 0;
++    Duration duration(FLAGS_duration, 0);
++
++    std::unique_ptr<const char[]> key_guard;
++    Slice key = AllocateKey(&key_guard);
++
++    init_zipf_generator(0, FLAGS_num);
++
++    // the number of iterations is the larger of read_ or write_
++    while (!duration.Done(1)) {
++      DB* db = SelectDB(thread);
++      // zipf
++      GenerateKeyFromInt(nextValue() % FLAGS_num, FLAGS_num, &key);
++
++      int next_op = thread->rand.Next() % 100;
++      if (next_op < 50) {
++        // read
++        Status s = db->Get(options, key, &value);
++        if (!s.ok() && !s.IsNotFound()) {
++          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
++          // we continue after error rather than exiting so that we can
++          // find more errors if any
++        } else if (!s.IsNotFound()) {
++          found++;
++        }
++        reads_done++;
++        thread->stats.FinishedOps(nullptr, db, 1, kRead);
++      } else {
++        // write
++        Status s = db->Put(write_options_, key, gen.Generate());
++        if (!s.ok()) {
++          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
++          ErrorExit();
++        }
++        writes_done++;
++        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
++      }
++    }
++    if (FLAGS_threads > 1) {
++      printf("( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
++             reads_done, writes_done, found);
++    }
++    else {
++      char msg[100];
++      snprintf(msg, sizeof(msg),
++              "( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
++              reads_done, writes_done, found);
++      thread->stats.AddMessage(msg);
++    }
++  }
++
++  // Workload B: Read mostly workload
++  // This workload has a 95/5 reads/write mix.
++  // Application example: photo tagging; add a tag is an update,
++  // but most operations are to read tags.
++
++  // Read/update ratio: 95/5
++  // Default data size: 1 KB records
++  // Request distribution: zipfian
++  void YCSBWorkloadB(ThreadState* thread) {
++    ReadOptions options(FLAGS_verify_checksum, true);
++    RandomGenerator gen;
++    std::string value;
++    int64_t found = 0;
++    int64_t reads_done = 0;
++    int64_t writes_done = 0;
++    Duration duration(FLAGS_duration, 0);
++
++    std::unique_ptr<const char[]> key_guard;
++    Slice key = AllocateKey(&key_guard);
++
++    init_zipf_generator(0, FLAGS_num);
++
++    // the number of iterations is the larger of read_ or write_
++    while (!duration.Done(1)) {
++      DB* db = SelectDB(thread);
++
++      // zipf
++      GenerateKeyFromInt(nextValue() % FLAGS_num, FLAGS_num, &key);
++
++      int next_op = thread->rand.Next() % 100;
++      if (next_op < 95) {
++        // read
++        Status s = db->Get(options, key, &value);
++        if (!s.ok() && !s.IsNotFound()) {
++          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
++          // we continue after error rather than exiting so that we can
++          // find more errors if any
++        } else if (!s.IsNotFound()) {
++          found++;
++        }
++        reads_done++;
++        thread->stats.FinishedOps(nullptr, db, 1, kRead);
++      } else {
++        // write
++        Status s = db->Put(write_options_, key, gen.Generate());
++        if (!s.ok()) {
++          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
++          ErrorExit();
++        }
++        writes_done++;
++        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
++      }
++    }
++    if (FLAGS_threads > 1) {
++      printf("( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
++             reads_done, writes_done, found);
++    }
++    else {
++      char msg[100];
++      snprintf(msg, sizeof(msg),
++              "( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
++              reads_done, writes_done, found);
++      thread->stats.AddMessage(msg);
++    }
++  }
++
++  // Workload F: Read-modify-write workload
++  // In this workload, the client will read a record,
++  // modify it, and write back the changes. Application
++  // example: user database, where user records are read
++  // and modified by the user or to record user activity.
++
++  // Read/read-modify-write ratio: 50/50
++  // Default data size: 1 KB records
++  // Request distribution: zipfian
++
++  void YCSBWorkloadF(ThreadState* thread) {
++    ReadOptions options(FLAGS_verify_checksum, true);
++    RandomGenerator gen;
++    std::string value;
++    int64_t found = 0;
++    int64_t reads_done = 0;
++    int64_t updates_done = 0;
++    Duration duration(FLAGS_duration, 0);
++
++    std::unique_ptr<const char[]> key_guard;
++    Slice key = AllocateKey(&key_guard);
++
++    init_zipf_generator(0, FLAGS_num);
++
++    // the number of iterations is the larger of read_ or write_
++    while (!duration.Done(1)) {
++      DB* db = SelectDB(thread);
++      // zipf
++      GenerateKeyFromInt(nextValue() % FLAGS_num, FLAGS_num, &key);
++
++      int next_op = thread->rand.Next() % 100;
++      if (next_op < 50) {
++        // read
++        Status s = db->Get(options, key, &value);
++        if (!s.ok() && !s.IsNotFound()) {
++          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
++          // we continue after error rather than exiting so that we can
++          // find more errors if any
++        } else if (!s.IsNotFound()) {
++          found++;
++        }
++        reads_done++;
++        thread->stats.FinishedOps(nullptr, db, 1, kRead);
++      } else {
++        // read-modify-write
++        Status s = db->Get(options, key, &value);
++        s = db->Put(write_options_, key, gen.Generate());
++        if (!s.ok()) {
++          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
++          ErrorExit();
++        }
++        updates_done++;
++        thread->stats.FinishedOps(nullptr, db, 1, kUpdate);
++      }
++    }
++    if (FLAGS_threads > 1) {
++      printf("( reads:%" PRIu64 " updates:%" PRIu64 " found:%" PRIu64 ")",
++             reads_done, updates_done, found);
++    } else {
++      char msg[100];
++      snprintf(msg, sizeof(msg),
++               "( reads:%" PRIu64 " updates:%" PRIu64" found:%" PRIu64 ")",
++               reads_done, updates_done, found);
++      thread->stats.AddMessage(msg);
++    }
++  }
++
+   //
+   // Read-modify-write for random keys
+   void UpdateRandom(ThreadState* thread) {
+@@ -7781,6 +8004,10 @@ int db_bench_tool(int argc, char** argv) {
+   }
+ 
+   ROCKSDB_NAMESPACE::Benchmark benchmark;
++  // Initialize the zipf distribution for YCSB
++  init_zipf_generator(0, FLAGS_num);
++  init_latestgen(FLAGS_num);
++
+   benchmark.Run();
+ 
+ #ifndef ROCKSDB_LITE
+diff --git a/util/latest-generator.cc b/util/latest-generator.cc
+new file mode 100644
+index 000000000..30b68b629
+--- /dev/null
++++ b/util/latest-generator.cc
+@@ -0,0 +1,26 @@
++#include "latest-generator.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++
++#include "zipf.h"
++
++long last_value_latestgen;
++long count_basis_latestgen;
++
++// init_val should be the same parameter as the one the zipf generator is
++// initialized with
++void init_latestgen(long init_val) {
++  count_basis_latestgen = init_val;
++  // should init the zipf generator here, but it is already initialized
++  next_value_latestgen();
++}
++
++long next_value_latestgen() {
++  long max = count_basis_latestgen - 1;
++  long next = max - nextLong(max);
++  last_value_latestgen = next;
++  return next;
++}
+diff --git a/util/latest-generator.h b/util/latest-generator.h
+new file mode 100644
+index 000000000..f4eaab6a1
+--- /dev/null
++++ b/util/latest-generator.h
+@@ -0,0 +1,5 @@
++extern long last_value_latestgen;
++extern long count_basis_latestgen;
++
++void init_latestgen(long init_val);
++long next_value_latestgen();
+diff --git a/util/zipf.cc b/util/zipf.cc
+new file mode 100644
+index 000000000..4e19b16f8
+--- /dev/null
++++ b/util/zipf.cc
+@@ -0,0 +1,86 @@
++#include "zipf.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++
++// 	*
++// 	 * Create a zipfian generator for items between min and max (inclusive)
++// for the specified zipfian constant, using the precomputed value of zeta.
++// 	 *
++// 	 * @param min The smallest integer to generate in the sequence.
++// 	 * @param max The largest integer to generate in the sequence.
++
++long items;              // initialized in init_zipf_generator function
++long base;               // initialized in init_zipf_generator function
++double zipfianconstant;  // initialized in init_zipf_generator function
++double alpha;            // initialized in init_zipf_generator function
++double zetan;            // initialized in init_zipf_generator function
++double eta;              // initialized in init_zipf_generator function
++double theta;            // initialized in init_zipf_generator function
++double zeta2theta;       // initialized in init_zipf_generator function
++long countforzeta;       // initialized in init_zipf_generator function
++long lastVal;            // initialized in setLastValue
++
++void init_zipf_generator(long min, long max) {
++  items = max - min + 1;
++  base = min;
++  zipfianconstant = 0.99;
++  theta = zipfianconstant;
++  zeta2theta = zeta(0, 2, 0);
++  alpha = 1.0 / (1.0 - theta);
++  zetan = zetastatic(0, max - min + 1, 0);
++  countforzeta = items;
++  eta = (1 - pow(2.0 / items, 1 - theta)) / (1 - zeta2theta / zetan);
++
++  nextValue();
++}
++
++double zeta(long st, long n, double initialsum) {
++  countforzeta = n;
++  return zetastatic(st, n, initialsum);
++}
++
++// initialsum is the value of zeta we are computing incrementally from
++double zetastatic(long st, long n, double initialsum) {
++  double sum = initialsum;
++  for (long i = st; i < n; i++) {
++    sum += 1 / (pow(i + 1, theta));
++  }
++  return sum;
++}
++
++long nextLong(long itemcount) {
++  // from "Quickly Generating Billion-Record Synthetic Databases", Jim Gray et
++  // al, SIGMOD 1994
++  if (itemcount != countforzeta) {
++    if (itemcount > countforzeta) {
++      printf(
++          "WARNING: Incrementally recomputing Zipfian distribtion. (itemcount= "
++          "%ld; countforzeta= %ld)",
++          itemcount, countforzeta);
++      // we have added more items. can compute zetan incrementally, which is
++      // cheaper
++      zetan = zeta(countforzeta, itemcount, zetan);
++      eta = (1 - pow(2.0 / items, 1 - theta)) / (1 - zeta2theta / zetan);
++    }
++  }
++
++  double u = (double)rand() / ((double)RAND_MAX);
++  double uz = u * zetan;
++  if (uz < 1.0) {
++    return base;
++  }
++
++  if (uz < 1.0 + pow(0.5, theta)) {
++    return base + 1;
++  }
++  long ret = base + (long)((itemcount)*pow(eta * u - eta + 1, alpha));
++  setLastValue(ret);
++  return ret;
++}
++
++long nextValue() { return nextLong(items); }
++
++void setLastValue(long val) { lastVal = val; }
+diff --git a/util/zipf.h b/util/zipf.h
+new file mode 100644
+index 000000000..79e86c9f3
+--- /dev/null
++++ b/util/zipf.h
+@@ -0,0 +1,17 @@
++extern long items;              // initialized in init_zipf_generator function
++extern long base;               // initialized in init_zipf_generator function
++extern double zipfianconstant;  // initialized in init_zipf_generator function
++extern double alpha;            // initialized in init_zipf_generator function
++extern double zetan;            // initialized in init_zipf_generator function
++extern double eta;              // initialized in init_zipf_generator function
++extern double theta;            // initialized in init_zipf_generator function
++extern double zeta2theta;       // initialized in init_zipf_generator function
++extern long countforzeta;       // initialized in init_zipf_generator function
++extern long lastVal;            // initialized in setLastValue
++
++void init_zipf_generator(long min, long max);
++double zeta(long st, long n, double initialsum);
++double zetastatic(long st, long n, double initialsum);
++long nextLong(long itemcount);
++long nextValue();
++void setLastValue(long val);

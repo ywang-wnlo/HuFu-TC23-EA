@@ -1,0 +1,72 @@
+diff --git a/engines/io_uring.c b/engines/io_uring.c
+index 27a4a678..483bb848 100644
+--- a/engines/io_uring.c
++++ b/engines/io_uring.c
+@@ -362,6 +362,9 @@ static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
+ 	}
+ 
+ 	sqe->user_data = (unsigned long) io_u;
++	if (td->o.bg) {
++		sqe->bg_id = 4; // FIO_ID
++	}
+ 	return 0;
+ }
+ 
+diff --git a/io_u.c b/io_u.c
+index 5289b5d1..b071f948 100644
+--- a/io_u.c
++++ b/io_u.c
+@@ -645,7 +645,7 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
+ 	uint64_t usec;
+ 	uint64_t now;
+ 
+-	assert(ddir_rw(ddir));
++	// assert(ddir_rw(ddir));
+ 	now = utime_since_now(&td->epoch);
+ 
+ 	/*
+diff --git a/options.c b/options.c
+index 460cf4ff..eed02393 100644
+--- a/options.c
++++ b/options.c
+@@ -2663,6 +2663,16 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
+ 		.help	= "Your platform does not support sync_file_range",
+ 	},
+ #endif
++	{
++		.name	= "bg",
++		.lname	= "Mark as Background",
++		.type	= FIO_OPT_BOOL,
++		.off1	= offsetof(struct thread_options, bg),
++		.help	= "Mark all IO as Background",
++		.def	= "0",
++		.category = FIO_OPT_C_IO,
++		.group	= FIO_OPT_G_IO_TYPE,
++	},
+ 	{
+ 		.name	= "direct",
+ 		.lname	= "Direct I/O",
+diff --git a/os/linux/io_uring.h b/os/linux/io_uring.h
+index d39b45fd..f28681e9 100644
+--- a/os/linux/io_uring.h
++++ b/os/linux/io_uring.h
+@@ -60,6 +60,7 @@ struct io_uring_sqe {
+ 			/* personality to use, if used */
+ 			__u16	personality;
+ 			__s32	splice_fd_in;
++			__u32   bg_id;
+ 		};
+ 		__u64	__pad2[3];
+ 	};
+diff --git a/thread_options.h b/thread_options.h
+index 6e1a2cdd..9fb76045 100644
+--- a/thread_options.h
++++ b/thread_options.h
+@@ -123,6 +123,7 @@ struct thread_options {
+ 	unsigned int open_files;
+ 	enum file_lock_mode file_lock_mode;
+ 
++	unsigned int bg;
+ 	unsigned int odirect;
+ 	unsigned int oatomic;
+ 	unsigned int invalidate_cache;
