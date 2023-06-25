@@ -1,0 +1,4219 @@
+diff --git a/femu-scripts/run-blackbox.sh b/femu-scripts/run-blackbox.sh
+index 03d2a19a3..35997a171 100755
+--- a/femu-scripts/run-blackbox.sh
++++ b/femu-scripts/run-blackbox.sh
+@@ -20,12 +20,12 @@ sudo x86_64-softmmu/qemu-system-x86_64 \
+     -name "FEMU-BBSSD-VM" \
+     -enable-kvm \
+     -cpu host \
+-    -smp 4 \
++    -smp 16 \
+     -m 4G \
+     -device virtio-scsi-pci,id=scsi0 \
+     -device scsi-hd,drive=hd0 \
+     -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0 \
+-    -device femu,devsz_mb=4096,femu_mode=1 \
++    -device femu,devsz_mb=204800,femu_mode=1 \
+     -net user,hostfwd=tcp::8080-:22 \
+     -net nic,model=virtio \
+     -nographic \
+diff --git a/hw/block/femu/bbssd/bb.c b/hw/block/femu/bbssd/bb.c
+index 84536013b..eabcfc1bd 100644
+--- a/hw/block/femu/bbssd/bb.c
++++ b/hw/block/femu/bbssd/bb.c
+@@ -17,7 +17,6 @@ static void bb_init(FemuCtrl *n, Error **errp)
+ 
+     bb_init_ctrl_str(n);
+ 
+-    ssd->dataplane_started_ptr = &n->dataplane_started;
+     ssd->ssdname = (char *)n->devname;
+     femu_debug("Starting FEMU in Blackbox-SSD mode ...\n");
+     ssd_init(n);
+@@ -27,46 +26,147 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
+ {
+     struct ssd *ssd = n->ssd;
+     int64_t cdw10 = le64_to_cpu(cmd->cdw10);
++    int64_t cdw11 = le64_to_cpu(cmd->cdw11);
++    int64_t cdw12 = le64_to_cpu(cmd->cdw12);
++    int64_t cdw13 = le64_to_cpu(cmd->cdw13);
++    int64_t cdw14 = le64_to_cpu(cmd->cdw14);
+ 
+     switch (cdw10) {
+     case FEMU_ENABLE_GC_DELAY:
+         ssd->sp.enable_gc_delay = true;
+-        femu_log("%s,FEMU GC Delay Emulation [Enabled]!\n", n->devname);
++        femu_log("%s, FEMU GC Delay Emulation [Enabled]!\n", n->devname);
+         break;
+     case FEMU_DISABLE_GC_DELAY:
+         ssd->sp.enable_gc_delay = false;
+-        femu_log("%s,FEMU GC Delay Emulation [Disabled]!\n", n->devname);
++        femu_log("%s, FEMU GC Delay Emulation [Disabled]!\n", n->devname);
+         break;
+     case FEMU_ENABLE_DELAY_EMU:
+         ssd->sp.pg_rd_lat = NAND_READ_LATENCY;
+         ssd->sp.pg_wr_lat = NAND_PROG_LATENCY;
+         ssd->sp.blk_er_lat = NAND_ERASE_LATENCY;
+         ssd->sp.ch_xfer_lat = 0;
+-        femu_log("%s,FEMU Delay Emulation [Enabled]!\n", n->devname);
++        femu_log("%s, FEMU Delay Emulation [Enabled]!\n", n->devname);
+         break;
+     case FEMU_DISABLE_DELAY_EMU:
+         ssd->sp.pg_rd_lat = 0;
+         ssd->sp.pg_wr_lat = 0;
+         ssd->sp.blk_er_lat = 0;
+         ssd->sp.ch_xfer_lat = 0;
+-        femu_log("%s,FEMU Delay Emulation [Disabled]!\n", n->devname);
++        femu_log("%s, FEMU Delay Emulation [Disabled]!\n", n->devname);
+         break;
+     case FEMU_RESET_ACCT:
+-        n->nr_tt_ios = 0;
+-        n->nr_tt_late_ios = 0;
+-        femu_log("%s,Reset tt_late_ios/tt_ios,%lu/%lu\n", n->devname,
+-                n->nr_tt_late_ios, n->nr_tt_ios);
++        for (int i = 1; i <= n->num_io_queues; i++) {
++            femu_log("%s, [%d] tt_late_ios/tt_ios:%lu/%lu, max_late:%lu\n",
++                     n->devname, i, n->nr_tt_late_ios[i], n->nr_tt_ios[i],
++                     n->max_late[i]);
++            n->nr_tt_ios[i] = 0;
++            n->nr_tt_late_ios[i] = 0;
++            n->max_late[i] = 0;
++        }
+         break;
+-    case FEMU_ENABLE_LOG:
+-        n->print_log = true;
+-        femu_log("%s,Log print [Enabled]!\n", n->devname);
++    case FEMU_ENABLE_LOGGING:
++        n->logging = true;
++        femu_log("%s, Logging [Enabled]!\n", n->devname);
+         break;
+-    case FEMU_DISABLE_LOG:
+-        n->print_log = false;
+-        femu_log("%s,Log print [Disabled]!\n", n->devname);
++    case FEMU_DISABLE_LOGGING:
++        n->logging = false;
++        femu_log("%s, Logging [Disabled]!\n", n->devname);
++        break;
++    case FEMU_ENABLE_BG_DELAY:
++        ssd->sp.enable_bg_delay = true;
++        femu_log("%s, FEMU BG Delay Emulation [Enabled]!\n", n->devname);
++        break;
++    case FEMU_DISABLE_BG_DELAY:
++        ssd->sp.enable_bg_delay = false;
++        femu_log("%s, FEMU BG Delay Emulation [Disabled]!\n", n->devname);
++        break;
++    case FEMU_HUFU_DEBUG:
++        if (cdw11 || cdw12 || cdw13) {
++            if (cdw11 || cdw12) {
++                add_bg(n, (char *)"L1+ Compaction Write", COMPACTION_ID, cdw11,
++                       cdw12);
++            }
++            if (cdw13) {
++                add_bg(n, (char *)"FIO", FIO_ID, 0, cdw13);
++            }
++            print_bgs(n);
++        } else {
++            BGInfo *bg = find_bg(n, COMPACTION_ID);
++            if (bg) {
++                del_bg(n, bg);
++            }
++            bg = find_bg(n, FIO_ID);
++            if (bg) {
++                del_bg(n, bg);
++            }
++        }
++        n->bg_manage.max_pending_pages = 256 * cdw14;
++        femu_log("%s, set limit BG cost = %ldM\n", n->devname, cdw14);
++        break;
++    case FEMU_INFO_PRINTF:
++        print_bgs(n);
++        femu_log("%s, ssd->free_bg_pages: %ld, ssd->qos_bg_pages: %ld, free "
++                 "rate=%.2lf%%\n",
++                 n->devname, ssd->free_bg_pages, ssd->qos_bg_pages,
++                 100.0 * ssd->free_bg_pages /
++                     (ssd->free_bg_pages + ssd->qos_bg_pages));
++        ssd->free_bg_pages = 0;
++        ssd->qos_bg_pages = 0;
++        break;
++    case FEMU_IDLE_THRE:
++        ssd->idle_thre = (double)cdw11 / 100;
++        femu_log("%s, ssd->idle_thre: %lf\n", n->devname, ssd->idle_thre);
+         break;
+     default:
+-        printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
++        femu_log("%s, Not implemented flip cmd (%lu)\n", n->devname, cdw10);
++    }
++}
++
++static void bb_bg_deadline(FemuCtrl *n, NvmeCmd *cmd)
++{
++    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
++    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
++    uint32_t bg_id = le32_to_cpu(cmd->cdw10);
++    uint32_t flags = le32_to_cpu(cmd->cdw11);
++    uint32_t qos = le32_to_cpu(cmd->cdw12);
++    BGInfo *bg = find_bg(n, bg_id);
++
++    if (bg) {
++        switch (flags) {
++        case FLAG_QoS_BW:
++            bg->min_rw_bw = qos;
++            femu_debug("[UPDATE] bg_id:%u, min_rw_bw:%uMB/s\n", bg_id, qos);
++            break;
++        case FLAG_QoS_DDL:
++            bg->deadline = qos;
++            femu_debug("[UPDATE] bg_id:%u, deadline:%ums\n", bg_id, qos);
++            break;
++        case FLAG_DEREGISTER:
++            del_bg(n, bg);
++            femu_debug("[DELETE] bg_id:%u\n", bg_id);
++            break;
++        default:
++            femu_err("bg_id=%u, flags=%u, qos=%u\n", bg_id, flags, qos);
++            return;
++        }
++    } else {
++        uint8_t desc[BG_DESC_LEN];
++        dma_write_prp(n, desc, sizeof(desc), prp1, prp2);
++        switch (flags) {
++        case FLAG_QoS_BW:
++            femu_debug("[NEW] desc:%s, bg_id:%u, min_rw_bw:%uMB/s\n", desc,
++                       bg_id, qos);
++            add_bg(n, (char *)desc, bg_id, 0, qos);
++            break;
++        case FLAG_QoS_DDL:
++            femu_debug("[NEW] desc:%s, bg_id:%u, deadline:%ums\n", desc, bg_id,
++                       qos);
++            add_bg(n, (char *)desc, bg_id, qos, 0);
++            break;
++        default:
++            femu_err("bg_id=%u, flags=%u, qos=%u\n", bg_id, flags, qos);
++            return;
++        }
+     }
+ }
+ 
+@@ -94,6 +194,9 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
+     case NVME_ADM_CMD_FEMU_FLIP:
+         bb_flip(n, cmd);
+         return NVME_SUCCESS;
++    case NVME_ADM_CMD_BG_DEADLINE:
++        bb_bg_deadline(n, cmd);
++        return NVME_SUCCESS;
+     default:
+         return NVME_INVALID_OPCODE | NVME_DNR;
+     }
+diff --git a/hw/block/femu/bbssd/bg_manage.c b/hw/block/femu/bbssd/bg_manage.c
+new file mode 100644
+index 000000000..809bb98de
+--- /dev/null
++++ b/hw/block/femu/bbssd/bg_manage.c
+@@ -0,0 +1,126 @@
++#include "../nvme.h"
++
++void bg_manage_init(FemuCtrl *n)
++{
++    struct BGManage *bg_manage = &n->bg_manage;
++
++    bg_manage->hash_table = NULL;
++    bg_manage->last_picked = NULL;
++    pthread_rwlock_init(&bg_manage->rwlock, NULL);
++
++    bg_manage->smooth_factor = 1.2;
++    bg_manage->bw_diff_time = 1e9;      // 1s
++
++    bg_manage->bg_pending_pages = 0;
++    bg_manage->max_pending_pages = 256 * 128; // 128M
++
++    QTAILQ_INIT(&bg_manage->ddl_bg_list);
++
++    bg_manage->cur_max_ddl = INT64_MIN;
++    bg_manage->ddl_diff_time = 10e6;    // 10ms
++    bg_manage->max_index = 2 * MAX_DDL_NS / bg_manage->ddl_diff_time;
++    bg_manage->ddl_pending_pages = 0;
++    bg_manage->pending_pages =
++        g_malloc0(bg_manage->max_index * sizeof(uint32_t));
++    bg_manage->issued_pages =
++        g_malloc0(bg_manage->max_index * sizeof(uint32_t));
++    bg_manage->last_index = (uint32_t)-1;
++    bg_manage->cur_index = (uint32_t)-1;
++    bg_manage->g_min_rw_bw = 0.0;
++    bg_manage->ddl_min_rw_bg = 0.0;
++}
++
++BGInfo *find_bg(FemuCtrl *n, uint32_t id)
++{
++    struct BGManage *bg_manage = &n->bg_manage;
++    BGInfo *bg = NULL;
++
++    pthread_rwlock_rdlock(&bg_manage->rwlock);
++    HASH_FIND_INT(bg_manage->hash_table, &id, bg);
++    pthread_rwlock_unlock(&bg_manage->rwlock);
++
++    return bg;
++}
++
++BGInfo *add_bg(FemuCtrl *n, char *desc, uint32_t id, uint32_t deadline,
++                      uint32_t min_rw_bw)
++{
++    struct BGManage *bg_manage = &n->bg_manage;
++    // TODO: 预分配提升效率，避免初始化后立即派发 IO，而无法识别为后台
++    BGInfo *bg = (BGInfo *)malloc(sizeof(BGInfo));
++
++    bg->id = id;
++    bg->deadline = deadline;
++    strcpy(bg->desc, desc);
++
++    bg->min_rw_bw = (double)min_rw_bw;
++    bg->max_rw_bw = (double)min_rw_bw * bg_manage->smooth_factor;
++    bg->cur_rw_bw = 0.0;
++    bg->avg_rw_bw = 0.0;
++    bg->issued_pages = 0;
++    bg->start_time = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    bg->start_time -= bg->start_time % bg_manage->bw_diff_time;
++    bg->end_time = bg->start_time + bg_manage->bw_diff_time;
++
++    bg->entry.tqe_circ.tql_next = NULL;
++    bg->entry.tqe_circ.tql_prev = NULL;
++
++    QTAILQ_INIT(&bg->req_list);
++
++    pthread_rwlock_wrlock(&bg_manage->rwlock);
++    if (bg->deadline) {
++        QTAILQ_INSERT_TAIL(&(bg_manage->ddl_bg_list), bg, entry);
++    }
++    HASH_ADD_INT(bg_manage->hash_table, id, bg);
++    pthread_rwlock_unlock(&bg_manage->rwlock);
++    return bg;
++}
++
++void del_bg(FemuCtrl *n, BGInfo *bg)
++{
++    struct BGManage *bg_manage = &n->bg_manage;
++    NvmeRequest *req, *req_next;
++
++    pthread_rwlock_wrlock(&bg_manage->rwlock);
++    if (bg_manage->last_picked == bg) {
++        bg_manage->last_picked = bg->hh.next;
++    }
++    HASH_DEL(bg_manage->hash_table, bg);
++    if (QTAILQ_IN_USE(bg, entry)) {
++        QTAILQ_REMOVE(&(bg_manage->ddl_bg_list), bg, entry);
++    }
++    pthread_rwlock_unlock(&bg_manage->rwlock);
++
++    QTAILQ_FOREACH_SAFE(req, &bg->req_list, entry, req_next)
++    {
++        QTAILQ_REMOVE(&bg->req_list, req, entry);
++        femu_ring_enqueue(n->ftl_ring[0], (void *)&req, 1);
++    }
++
++    free(bg);
++    bg = NULL;
++}
++
++void print_bgs(FemuCtrl *n)
++{
++    struct BGManage *bg_manage = &n->bg_manage;
++    BGInfo *bg, *bg_next;
++
++    pthread_rwlock_rdlock(&bg_manage->rwlock);
++    HASH_ITER(hh, bg_manage->hash_table, bg, bg_next)
++    {
++        if (bg->deadline) {
++            continue;
++        }
++        femu_log("bg desc:%s, id:%u, min_rw_bw:%uMB/s\n", bg->desc, bg->id,
++                 (uint32_t)bg->min_rw_bw);
++    }
++
++    QTAILQ_FOREACH_SAFE(bg, &bg_manage->ddl_bg_list, entry, bg_next)
++    {
++        femu_log("bg desc:%s, id:%u, deadline:%ums\n", bg->desc, bg->id,
++                 bg->deadline);
++    }
++
++    pthread_rwlock_unlock(&bg_manage->rwlock);
++}
+diff --git a/hw/block/femu/bbssd/ftl.c b/hw/block/femu/bbssd/ftl.c
+index 5b9665dc1..c4bd9ab0d 100644
+--- a/hw/block/femu/bbssd/ftl.c
++++ b/hw/block/femu/bbssd/ftl.c
+@@ -2,7 +2,13 @@
+ 
+ //#define FEMU_DEBUG_FTL
+ 
++uint32_t nand_head = 0;
++uint32_t nand_tail = 0;
++uint64_t **nand_ring_buffer;
++
+ static void *ftl_thread(void *arg);
++static void *process_thread(void *args);
++static void *logging_thread(void *args);
+ 
+ static inline bool should_gc(struct ssd *ssd)
+ {
+@@ -116,6 +122,7 @@ static void ssd_init_lines(struct ssd *ssd)
+ 
+ static void ssd_init_write_pointer(struct ssd *ssd)
+ {
++    struct ssdparams *spp = &ssd->sp;
+     struct write_pointer *wpp = &ssd->wp;
+     struct line_mgmt *lm = &ssd->lm;
+     struct line *curline = NULL;
+@@ -126,11 +133,33 @@ static void ssd_init_write_pointer(struct ssd *ssd)
+ 
+     /* wpp->curline is always our next-to-write super-block */
+     wpp->curline = curline;
+-    wpp->ch = 0;
+-    wpp->lun = 0;
++    wpp->blk = wpp->curline->id;
+     wpp->pg = 0;
+-    wpp->blk = 0;
+-    wpp->pl = 0;
++    wpp->free_pg = bitmap_new(spp->tt_luns);
++    bitmap_fill(wpp->free_pg, spp->tt_luns);
++}
++
++static void ssd_init_gc_management(struct ssd *ssd)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct gc_read_pointer *gc_rpp = &ssd->gc_rp;
++    struct write_pointer *gc_wpp = &ssd->gc_wp;
++    struct line_mgmt *lm = &ssd->lm;
++    struct line *curline = NULL;
++
++    gc_rpp->gc_line = NULL;
++    gc_rpp->dirty_blk = bitmap_new(spp->tt_luns);
++    bitmap_fill(gc_rpp->dirty_blk, spp->tt_luns);
++
++    curline = QTAILQ_FIRST(&lm->free_line_list);
++    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
++    lm->free_line_cnt--;
++
++    gc_wpp->curline = curline;
++    gc_wpp->blk = gc_wpp->curline->id;
++    gc_wpp->pg = 0;
++    gc_wpp->free_pg = bitmap_new(spp->tt_luns);
++    bitmap_fill(gc_wpp->free_pg, spp->tt_luns);
+ }
+ 
+ static inline void check_addr(int a, int max)
+@@ -154,73 +183,32 @@ static struct line *get_next_free_line(struct ssd *ssd)
+     return curline;
+ }
+ 
+-static void ssd_advance_write_pointer(struct ssd *ssd)
++static void ssd_advance_write_pointer(struct ssd *ssd, struct write_pointer *wpp)
+ {
+     struct ssdparams *spp = &ssd->sp;
+-    struct write_pointer *wpp = &ssd->wp;
+     struct line_mgmt *lm = &ssd->lm;
+ 
+-    check_addr(wpp->ch, spp->nchs);
+-    wpp->ch++;
+-    if (wpp->ch == spp->nchs) {
+-        wpp->ch = 0;
+-        check_addr(wpp->lun, spp->luns_per_ch);
+-        wpp->lun++;
+-        /* in this case, we should go to next lun */
+-        if (wpp->lun == spp->luns_per_ch) {
+-            wpp->lun = 0;
+-            /* go to next page in the block */
+-            check_addr(wpp->pg, spp->pgs_per_blk);
+-            wpp->pg++;
+-            if (wpp->pg == spp->pgs_per_blk) {
+-                wpp->pg = 0;
+-                /* move current line to {victim,full} line list */
+-                if (wpp->curline->vpc == spp->pgs_per_line) {
+-                    /* all pgs are still valid, move to full line list */
+-                    ftl_assert(wpp->curline->ipc == 0);
+-                    QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
+-                    lm->full_line_cnt++;
+-                } else {
+-                    ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
+-                    /* there must be some invalid pages in this line */
+-                    ftl_assert(wpp->curline->ipc > 0);
+-                    pqueue_insert(lm->victim_line_pq, wpp->curline);
+-                    lm->victim_line_cnt++;
+-                }
+-                /* current line is used up, pick another empty line */
+-                check_addr(wpp->blk, spp->blks_per_pl);
+-                wpp->curline = NULL;
+-                wpp->curline = get_next_free_line(ssd);
+-                if (!wpp->curline) {
+-                    /* TODO */
+-                    abort();
+-                }
+-                wpp->blk = wpp->curline->id;
+-                check_addr(wpp->blk, spp->blks_per_pl);
+-                /* make sure we are starting from page 0 in the super block */
+-                ftl_assert(wpp->pg == 0);
+-                ftl_assert(wpp->lun == 0);
+-                ftl_assert(wpp->ch == 0);
+-                /* TODO: assume # of pl_per_lun is 1, fix later */
+-                ftl_assert(wpp->pl == 0);
+-            }
+-        }
++    if (wpp->curline->vpc == spp->pgs_per_line) {
++        /* all pgs are still valid, move to full line list */
++        ftl_assert(wpp->curline->ipc == 0);
++        QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
++        lm->full_line_cnt++;
++    } else {
++        ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
++        /* there must be some invalid pages in this line */
++        ftl_assert(wpp->curline->ipc > 0);
++        pqueue_insert(lm->victim_line_pq, wpp->curline);
++        lm->victim_line_cnt++;
+     }
+-}
+ 
+-static struct ppa get_new_page(struct ssd *ssd)
+-{
+-    struct write_pointer *wpp = &ssd->wp;
+-    struct ppa ppa;
+-    ppa.ppa = 0;
+-    ppa.g.ch = wpp->ch;
+-    ppa.g.lun = wpp->lun;
+-    ppa.g.pg = wpp->pg;
+-    ppa.g.blk = wpp->blk;
+-    ppa.g.pl = wpp->pl;
+-    ftl_assert(ppa.g.pl == 0);
+-
+-    return ppa;
++    wpp->curline = NULL;
++    wpp->curline = get_next_free_line(ssd);
++    if (!wpp->curline) {
++        /* TODO */
++        abort();
++    }
++    wpp->blk = wpp->curline->id;
++    wpp->pg = 0;
+ }
+ 
+ static void check_params(struct ssdparams *spp)
+@@ -238,8 +226,8 @@ static void ssd_init_params(struct ssdparams *spp)
+ {
+     spp->secsz = 512;
+     spp->secs_per_pg = 8;
+-    spp->pgs_per_blk = 256;
+-    spp->blks_per_pl = 256; /* 16GB */
++    spp->pgs_per_blk = 512;
++    spp->blks_per_pl = 2048; /* 256 GB */
+     spp->pls_per_lun = 1;
+     spp->luns_per_ch = 8;
+     spp->nchs = 8;
+@@ -276,12 +264,12 @@ static void ssd_init_params(struct ssdparams *spp)
+     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
+     spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
+ 
+-    spp->gc_thres_pcent = 0.75;
++    spp->gc_thres_pcent = 0.85;
+     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
+     spp->gc_thres_pcent_high = 0.95;
+     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
+     spp->enable_gc_delay = true;
+-
++    spp->enable_bg_delay = true;
+ 
+     check_params(spp);
+ }
+@@ -307,6 +295,7 @@ static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
+     blk->vpc = 0;
+     blk->erase_cnt = 0;
+     blk->wp = 0;
++    blk->valid_pg = bitmap_new(blk->npgs);
+ }
+ 
+ static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
+@@ -365,6 +354,8 @@ void ssd_init(FemuCtrl *n)
+     struct ssd *ssd = n->ssd;
+     struct ssdparams *spp = &ssd->sp;
+ 
++    ssd->n = n;
++
+     ftl_assert(ssd);
+ 
+     ssd_init_params(spp);
+@@ -387,8 +378,67 @@ void ssd_init(FemuCtrl *n)
+     /* initialize write pointer, this is how we allocate new pages for writes */
+     ssd_init_write_pointer(ssd);
+ 
++    ssd_init_gc_management(ssd);
++
++    ssd->idle_thre = 1.0;
++    ssd->idle_lun = bitmap_new(spp->tt_luns);
++
++    ssd->free_bg_pages = 0;
++    ssd->qos_bg_pages = 0;
++
++    ssd->nand_end_time = 0;
++    ssd->nand_read_pgs = 0;
++    ssd->nand_write_pgs = 0;
++    ssd->nand_erase_blks = 0;
++    ssd->gc_read_pgs = 0;
++    ssd->gc_write_pgs = 0;
++    ssd->gc_erase_blks = 0;
++
++    n->logging = false;
++    ssd->logging = &n->logging;
++    LogThreadArgument *nand_args =
++        (LogThreadArgument *)malloc(sizeof(LogThreadArgument));
++    nand_args->n = n;
++    nand_args->data_len = 9;
++    nand_ring_buffer = malloc(LOGGING_RING_BUF_MAX * sizeof(uint64_t *));
++    for (int i = 0; i < LOGGING_RING_BUF_MAX; i++) {
++        nand_ring_buffer[i] =
++            g_malloc0((nand_args->data_len + 1) * sizeof(uint64_t));
++    }
++    nand_args->ring_buffer = nand_ring_buffer;
++    nand_args->head = &nand_head;
++    nand_args->tail = &nand_tail;
++    nand_args->table_header =
++        "End Timestamp(100ms),Read pages,Write pages,Erase blocks,GC Read "
++        "pages,GC Write pages,GC Erase blocks,Utilization,GC Utilization";
++    nand_args->file = "./logs/nand.csv";
++    qemu_thread_create(&n->nand_logging_thread, "NAND-Log-Thread", logging_thread,
++                       nand_args, QEMU_THREAD_JOINABLE);
++
+     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
+                        QEMU_THREAD_JOINABLE);
++
++    ssd->process_ring =
++        malloc(sizeof(struct rte_ring *) * (n->num_io_queues + 1));
++    for (int i = 1; i <= n->num_io_queues; i++) {
++        ssd->process_ring[i] =
++            femu_ring_create(FEMU_RING_TYPE_SP_SC, FEMU_MAX_INF_REQS);
++        if (!ssd->process_ring[i]) {
++            femu_err("failed to create ring (ssd->process_ring) ...\n");
++            abort();
++        }
++        assert(rte_ring_empty(ssd->process_ring[i]));
++    }
++
++    ssd->process_thread = malloc(sizeof(QemuThread) * (n->num_threads + 1));
++    FemuThreadArgument *args =
++        malloc(sizeof(FemuThreadArgument) * (n->num_threads + 1));
++    for (int i = 1; i <= n->num_threads; i++) {
++        args[i].n = n;
++        args[i].index = i;
++        qemu_thread_create(&ssd->process_thread[i], "FEMU-Process-Thread",
++                           process_thread, &args[i], QEMU_THREAD_JOINABLE);
++    }
+ }
+ 
+ static inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
+@@ -458,73 +508,86 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
+ {
+     int c = ncmd->cmd;
+     uint64_t cmd_stime = (ncmd->stime == 0) ? \
+-        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;
+-    uint64_t nand_stime;
++        qemu_clock_get_ns(QEMU_CLOCK_HOST) : ncmd->stime;
+     struct ssdparams *spp = &ssd->sp;
+     struct nand_lun *lun = get_lun(ssd, ppa);
++    uint64_t nand_stime = (lun->next_lun_avail_time < cmd_stime)
++                              ? cmd_stime
++                              : lun->next_lun_avail_time;
+     uint64_t lat = 0;
+ 
+-    switch (c) {
+-    case NAND_READ:
+-        /* read: perform NAND cmd first */
+-        nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
+-                     lun->next_lun_avail_time;
+-        lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
+-        lat = lun->next_lun_avail_time - cmd_stime;
+-#if 0
+-        lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
+-
+-        /* read: then data transfer through channel */
+-        chnl_stime = (ch->next_ch_avail_time < lun->next_lun_avail_time) ? \
+-            lun->next_lun_avail_time : ch->next_ch_avail_time;
+-        ch->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
+-
+-        lat = ch->next_ch_avail_time - cmd_stime;
+-#endif
+-        break;
+-
+-    case NAND_WRITE:
+-        /* write: transfer data through channel first */
+-        nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
+-                     lun->next_lun_avail_time;
+-        if (ncmd->type == USER_IO) {
+-            lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
+-        } else {
++    if (((ncmd->type == BG_IO) && (!spp->enable_bg_delay)) ||
++        ((ncmd->type == GC_IO) && (!spp->enable_gc_delay))) {
++        lun->next_lun_avail_time = nand_stime;
++        ftl_debug("set %s io delay = 0\n", ncmd->type == BG_IO ? "BG" : "GC");
++    } else {
++        switch (c) {
++        case NAND_READ:
++            lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
++            break;
++        case NAND_WRITE:
+             lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
++            break;
++        case NAND_ERASE:
++            lun->next_lun_avail_time = nand_stime + spp->blk_er_lat;
++            break;
++        default:
++            ftl_err("Unsupported NAND command: 0x%x\n", c);
+         }
+-        lat = lun->next_lun_avail_time - cmd_stime;
+-
+-#if 0
+-        chnl_stime = (ch->next_ch_avail_time < cmd_stime) ? cmd_stime : \
+-                     ch->next_ch_avail_time;
+-        ch->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
+-
+-        /* write: then do NAND program */
+-        nand_stime = (lun->next_lun_avail_time < ch->next_ch_avail_time) ? \
+-            ch->next_ch_avail_time : lun->next_lun_avail_time;
+-        lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
+-
+-        lat = lun->next_lun_avail_time - cmd_stime;
+-#endif
+-        break;
+-
+-    case NAND_ERASE:
+-        /* erase: only need to advance NAND status */
+-        nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
+-                     lun->next_lun_avail_time;
+-        lun->next_lun_avail_time = nand_stime + spp->blk_er_lat;
+-
+-        lat = lun->next_lun_avail_time - cmd_stime;
+-        break;
++    }
++    lat = lun->next_lun_avail_time - cmd_stime;
+ 
+-    default:
+-        ftl_err("Unsupported NAND command: 0x%x\n", c);
++    if (*(ssd->logging)) {
++        if (nand_stime > ssd->nand_end_time) {
++            if (nand_ring_buffer[nand_head][8] == DATA_VALID) {
++                ftl_err("ERROR! NAND Ring Buffer Full!\n");
++            }
++            nand_ring_buffer[nand_head][0] = ssd->nand_end_time;
++            nand_ring_buffer[nand_head][1] = ssd->nand_read_pgs;
++            nand_ring_buffer[nand_head][2] = ssd->nand_write_pgs;
++            nand_ring_buffer[nand_head][3] = ssd->nand_erase_blks;
++            nand_ring_buffer[nand_head][4] = ssd->gc_read_pgs;
++            nand_ring_buffer[nand_head][5] = ssd->gc_write_pgs;
++            nand_ring_buffer[nand_head][6] = ssd->gc_erase_blks;
++            nand_ring_buffer[nand_head][7] =
++                100 *
++                (ssd->nand_read_pgs * (uint64_t)spp->pg_rd_lat +
++                 ssd->nand_write_pgs * (uint64_t)spp->pg_wr_lat +
++                 ssd->nand_erase_blks * (uint64_t)spp->blk_er_lat) /
++                ((uint64_t)NAND_DIFF_TIME * (uint64_t)spp->tt_luns);
++            nand_ring_buffer[nand_head][8] =
++                100 *
++                (ssd->gc_read_pgs * (uint64_t)spp->pg_rd_lat +
++                 ssd->gc_write_pgs * (uint64_t)spp->pg_wr_lat +
++                 ssd->gc_erase_blks * (uint64_t)spp->blk_er_lat) /
++                ((uint64_t)NAND_DIFF_TIME * (uint64_t)spp->tt_luns);
++            nand_ring_buffer[nand_head][9] = DATA_VALID;
++            ssd->nand_end_time =
++                nand_stime - nand_stime % NAND_DIFF_TIME + NAND_DIFF_TIME;
++            ssd->gc_read_pgs = 0;
++            ssd->gc_write_pgs = 0;
++            ssd->gc_erase_blks = 0;
++            ssd->nand_read_pgs = 0;
++            ssd->nand_write_pgs = 0;
++            ssd->nand_erase_blks = 0;
++            if (++nand_head == LOGGING_RING_BUF_MAX) {
++                nand_head = 0;
++            }
++        }
++        if (ncmd->type == GC_IO) {
++            ssd->gc_read_pgs += (c == NAND_READ);
++            ssd->gc_write_pgs += (c == NAND_WRITE);
++            ssd->gc_erase_blks += (c == NAND_ERASE);
++        }
++        ssd->nand_read_pgs += (c == NAND_READ);
++        ssd->nand_write_pgs += (c == NAND_WRITE);
++        ssd->nand_erase_blks += (c == NAND_ERASE);
+     }
+ 
+     return lat;
+ }
+ 
+-/* update SSD status about one page from PG_VALID -> PG_VALID */
++/* update SSD status about one page from PG_VALID -> PG_INVALID */
+ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
+ {
+     struct line_mgmt *lm = &ssd->lm;
+@@ -545,6 +608,7 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
+     blk->ipc++;
+     ftl_assert(blk->vpc > 0 && blk->vpc <= spp->pgs_per_blk);
+     blk->vpc--;
++    bitmap_clear(blk->valid_pg, ppa->g.pg, 1);
+ 
+     /* update corresponding line status */
+     line = get_line(ssd, ppa);
+@@ -560,7 +624,6 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
+     } else {
+         line->vpc--;
+     }
+-
+     if (was_full_line) {
+         /* move line: "full" -> "victim" */
+         QTAILQ_REMOVE(&lm->full_line_list, line, entry);
+@@ -585,6 +648,7 @@ static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
+     blk = get_blk(ssd, ppa);
+     ftl_assert(blk->vpc >= 0 && blk->vpc < ssd->sp.pgs_per_blk);
+     blk->vpc++;
++    bitmap_set(blk->valid_pg, ppa->g.pg, 1);
+ 
+     /* update corresponding line status */
+     line = get_line(ssd, ppa);
+@@ -592,6 +656,69 @@ static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
+     line->vpc++;
+ }
+ 
++static struct ppa get_new_page(struct ssd *ssd, int type)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct write_pointer *wpp = &ssd->wp;
++    struct nand_lun *lun_iter = NULL;
++    int64_t now, min_time;
++    uint32_t pg_id, min_pg_id;
++    struct ppa ppa;
++
++    if (type == GC_IO) {
++        wpp = &ssd->gc_wp;
++    }
++
++    ppa.ppa = 0;
++    ppa.g.blk = wpp->blk;
++    ppa.g.pg = wpp->pg;
++
++    now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    min_time = INT64_MAX;
++    min_pg_id = -1;
++
++    pg_id = find_first_bit(wpp->free_pg, spp->tt_luns);
++    while (pg_id < spp->tt_luns) {
++        ppa.g.ch = pg_id % spp->nchs;
++        ppa.g.lun = (pg_id / spp->nchs) % spp->luns_per_ch;
++        ppa.g.pl = pg_id / spp->tt_luns;
++        ftl_assert(ppa.g.pl == 0);
++        lun_iter = get_lun(ssd, &ppa);
++
++        if (lun_iter->next_lun_avail_time <= now) {
++            break;
++        }
++
++        if (lun_iter->next_lun_avail_time < min_time) {
++            min_time = lun_iter->next_lun_avail_time;
++            min_pg_id = pg_id;
++        }
++
++        pg_id = find_next_bit(wpp->free_pg, spp->tt_luns, pg_id + 1);
++    }
++
++    if (pg_id == spp->tt_luns) {
++        pg_id = min_pg_id;
++        ppa.g.ch = pg_id % spp->nchs;
++        ppa.g.lun = (pg_id / spp->nchs) % spp->luns_per_ch;
++        ppa.g.pl = pg_id / spp->tt_luns;
++        ftl_assert(ppa.g.pl == 0);
++    }
++
++    bitmap_clear(wpp->free_pg, pg_id, 1);
++    mark_page_valid(ssd, &ppa);
++
++    if (bitmap_empty(wpp->free_pg, spp->tt_luns)) {
++        bitmap_fill(wpp->free_pg, spp->tt_luns);
++        wpp->pg++;
++        if (wpp->pg == spp->pgs_per_blk) {
++            ssd_advance_write_pointer(ssd, wpp);
++        }
++    }
++
++    return ppa;
++}
++
+ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
+ {
+     struct ssdparams *spp = &ssd->sp;
+@@ -615,54 +742,48 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
+ static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
+ {
+     /* advance ssd status, we don't care about how long it takes */
+-    if (ssd->sp.enable_gc_delay) {
+-        struct nand_cmd gcr;
+-        gcr.type = GC_IO;
+-        gcr.cmd = NAND_READ;
+-        gcr.stime = 0;
+-        ssd_advance_status(ssd, ppa, &gcr);
+-    }
++    struct nand_cmd gcr;
++    gcr.type = GC_IO;
++    gcr.cmd = NAND_READ;
++    gcr.stime = 0;
++    ssd_advance_status(ssd, ppa, &gcr);
+ }
+ 
+ /* move valid page data (already in DRAM) from victim line to a new page */
+ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
+ {
+     struct ppa new_ppa;
+-    struct nand_lun *new_lun;
++    struct nand_cmd gcw;
+     uint64_t lpn = get_rmap_ent(ssd, old_ppa);
+ 
++    // update old page information first
++    mark_page_invalid(ssd, old_ppa);
++    set_rmap_ent(ssd, INVALID_LPN, old_ppa);
++
+     ftl_assert(valid_lpn(ssd, lpn));
+-    new_ppa = get_new_page(ssd);
++    new_ppa = get_new_page(ssd, GC_IO);
+     /* update maptbl */
+     set_maptbl_ent(ssd, lpn, &new_ppa);
+     /* update rmap */
+     set_rmap_ent(ssd, lpn, &new_ppa);
+ 
+-    mark_page_valid(ssd, &new_ppa);
+-
+-    /* need to advance the write pointer here */
+-    ssd_advance_write_pointer(ssd);
+-
+-    if (ssd->sp.enable_gc_delay) {
+-        struct nand_cmd gcw;
+-        gcw.type = GC_IO;
+-        gcw.cmd = NAND_WRITE;
+-        gcw.stime = 0;
+-        ssd_advance_status(ssd, &new_ppa, &gcw);
+-    }
+-
+-    /* advance per-ch gc_endtime as well */
+-#if 0
+-    new_ch = get_ch(ssd, &new_ppa);
+-    new_ch->gc_endtime = new_ch->next_ch_avail_time;
+-#endif
+-
+-    new_lun = get_lun(ssd, &new_ppa);
+-    new_lun->gc_endtime = new_lun->next_lun_avail_time;
++    gcw.type = GC_IO;
++    gcw.cmd = NAND_WRITE;
++    gcw.stime = 0;
++    ssd_advance_status(ssd, &new_ppa, &gcw);
+ 
+     return 0;
+ }
+ 
++static void gc_erase_block(struct ssd *ssd, struct ppa *ppa)
++{
++    struct nand_cmd gce;
++    gce.type = GC_IO;
++    gce.cmd = NAND_ERASE;
++    gce.stime = 0;
++    ssd_advance_status(ssd, ppa, &gce);
++}
++
+ static struct line *select_victim_line(struct ssd *ssd, bool force)
+ {
+     struct line_mgmt *lm = &ssd->lm;
+@@ -673,7 +794,7 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
+         return NULL;
+     }
+ 
+-    if (!force && victim_line->ipc < ssd->sp.pgs_per_line / 8) {
++    if (!force && (victim_line->ipc < ssd->sp.pgs_per_line / 20)) {
+         return NULL;
+     }
+ 
+@@ -688,30 +809,25 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
+ /* here ppa identifies the block we want to clean */
+ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
+ {
+-    struct ssdparams *spp = &ssd->sp;
+-    struct nand_page *pg_iter = NULL;
+-    int cnt = 0;
++    struct nand_block *cur_blk = get_blk(ssd, ppa);
++    int pg, cnt = 0;
+ 
+-    for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
++    pg = find_first_bit(cur_blk->valid_pg, cur_blk->npgs);
++    while (pg < cur_blk->npgs) {
+         ppa->g.pg = pg;
+-        pg_iter = get_pg(ssd, ppa);
+-        /* there shouldn't be any free page in victim blocks */
+-        ftl_assert(pg_iter->status != PG_FREE);
+-        if (pg_iter->status == PG_VALID) {
+-            gc_read_page(ssd, ppa);
+-            /* delay the maptbl update until "write" happens */
+-            gc_write_page(ssd, ppa);
+-            cnt++;
+-        }
++        gc_read_page(ssd, ppa);
++        /* delay the maptbl update until "write" happens */
++        gc_write_page(ssd, ppa);
++        cnt++;
++        pg = find_next_bit(cur_blk->valid_pg, cur_blk->npgs, pg + 1);
+     }
+ 
+     ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
+ }
+ 
+-static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
++static void mark_line_free(struct ssd *ssd, struct line *line)
+ {
+     struct line_mgmt *lm = &ssd->lm;
+-    struct line *line = get_line(ssd, ppa);
+     line->ipc = 0;
+     line->vpc = 0;
+     /* move this line to free line list */
+@@ -719,82 +835,85 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
+     lm->free_line_cnt++;
+ }
+ 
+-static int do_gc(struct ssd *ssd, bool force)
++static int force_gc(struct ssd *ssd)
+ {
+-    struct line *victim_line = NULL;
+     struct ssdparams *spp = &ssd->sp;
+-    struct nand_lun *lunp;
++    struct gc_read_pointer *gc_rpp = &ssd->gc_rp;
+     struct ppa ppa;
+-    int ch, lun;
+-
+-    victim_line = select_victim_line(ssd, force);
+-    if (!victim_line) {
+-        return -1;
++    uint32_t lun_id;
++
++    if (!gc_rpp->gc_line) {
++        gc_rpp->gc_line = select_victim_line(ssd, true);
++        if (!gc_rpp->gc_line) {
++            ftl_err("force_gc select_victim_line return NULL! Please check "
++                    "gc_thres_pcent_high and OP configuration\n");
++            return 1;
++        }
+     }
+ 
+-    ppa.g.blk = victim_line->id;
+-    ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
+-              victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
++    ppa.ppa = 0;
++    ppa.g.blk = gc_rpp->gc_line->id;
++    ppa.g.pg = 0;
++
++    ftl_debug("force_gc line:%d,ipc=%d,vpc=%d,victim=%d,full=%d,free=%d\n",
++              ppa.g.blk, gc_rpp->gc_line->ipc, gc_rpp->gc_line->vpc,
++              ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
+               ssd->lm.free_line_cnt);
+ 
+-    /* copy back valid data */
+-    for (ch = 0; ch < spp->nchs; ch++) {
+-        for (lun = 0; lun < spp->luns_per_ch; lun++) {
+-            ppa.g.ch = ch;
+-            ppa.g.lun = lun;
+-            ppa.g.pl = 0;
+-            lunp = get_lun(ssd, &ppa);
+-            clean_one_block(ssd, &ppa);
+-            mark_block_free(ssd, &ppa);
+-
+-            if (spp->enable_gc_delay) {
+-                struct nand_cmd gce;
+-                gce.type = GC_IO;
+-                gce.cmd = NAND_ERASE;
+-                gce.stime = 0;
+-                ssd_advance_status(ssd, &ppa, &gce);
+-            }
++    lun_id = find_first_bit(gc_rpp->dirty_blk, spp->tt_luns);
++    while (lun_id < spp->tt_luns) {
++        ppa.g.ch = lun_id % spp->nchs;
++        ppa.g.lun = (lun_id / spp->nchs) % spp->luns_per_ch;
++        ppa.g.pl = lun_id / spp->tt_luns;
++        ftl_assert(ppa.g.pl == 0);
+ 
+-            lunp->gc_endtime = lunp->next_lun_avail_time;
+-        }
++        clean_one_block(ssd, &ppa);
++        gc_erase_block(ssd, &ppa);
++        mark_block_free(ssd, &ppa);
++        bitmap_clear(gc_rpp->dirty_blk, lun_id, 1);
++        ftl_debug("do force gc block[%d-%d] free\n", ppa.g.blk, lun_id);
++
++        lun_id = find_next_bit(gc_rpp->dirty_blk, spp->tt_luns, lun_id + 1);
+     }
+ 
+     /* update line status */
+-    mark_line_free(ssd, &ppa);
+-
++    mark_line_free(ssd, gc_rpp->gc_line);
++    ftl_debug("do force gc line free\n");
++    gc_rpp->gc_line = NULL;
++    bitmap_fill(gc_rpp->dirty_blk, spp->tt_luns);
+     return 0;
+ }
+ 
+ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
+ {
+     struct ssdparams *spp = &ssd->sp;
+-    uint64_t lba = req->slba;
+-    int nsecs = req->nlb;
++    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
++    uint64_t slba = le64_to_cpu(rw->slba);
++    uint32_t nlb  = le16_to_cpu(rw->nlb) + 1;
++    uint64_t start_lpn = slba / spp->secs_per_pg;
++    uint64_t end_lpn = (slba + nlb - 1) / spp->secs_per_pg;
+     struct ppa ppa;
+-    uint64_t start_lpn = lba / spp->secs_per_pg;
+-    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+     uint64_t lpn;
+     uint64_t sublat, maxlat = 0;
+ 
+     if (end_lpn >= spp->tt_pgs) {
+-        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
++        ftl_err("start_lpn=%lu, end_lpn=%lu, tt_pgs=%d\n", start_lpn, end_lpn,
++                ssd->sp.tt_pgs);
++        return 0;
+     }
+ 
+     /* normal IO read path */
+     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+         ppa = get_maptbl_ent(ssd, lpn);
+-        if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
+-            //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
+-            //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
+-            //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
+-            continue;
++        if (!mapped_ppa(&ppa)) {
++            sublat = 0;
++        } else {
++            struct nand_cmd srd;
++            srd.type = req->io_type;
++            srd.cmd = NAND_READ;
++            srd.stime = req->stime;
++            sublat = ssd_advance_status(ssd, &ppa, &srd);
+         }
+-
+-        struct nand_cmd srd;
+-        srd.type = USER_IO;
+-        srd.cmd = NAND_READ;
+-        srd.stime = req->stime;
+-        sublat = ssd_advance_status(ssd, &ppa, &srd);
+         maxlat = (sublat > maxlat) ? sublat : maxlat;
+     }
+ 
+@@ -803,25 +922,24 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
+ 
+ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+ {
+-    uint64_t lba = req->slba;
+     struct ssdparams *spp = &ssd->sp;
+-    int len = req->nlb;
+-    uint64_t start_lpn = lba / spp->secs_per_pg;
+-    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
++    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
++    uint64_t slba = le64_to_cpu(rw->slba);
++    uint32_t nlb  = le16_to_cpu(rw->nlb) + 1;
++    uint64_t start_lpn = slba / spp->secs_per_pg;
++    uint64_t end_lpn = (slba + nlb - 1) / spp->secs_per_pg;
+     struct ppa ppa;
+     uint64_t lpn;
+     uint64_t curlat = 0, maxlat = 0;
+-    int r;
+ 
+     if (end_lpn >= spp->tt_pgs) {
+-        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
++        ftl_err("start_lpn=%lu, end_lpn=%lu, tt_pgs=%d\n", start_lpn, end_lpn,
++                ssd->sp.tt_pgs);
++        return 0;
+     }
+ 
+     while (should_gc_high(ssd)) {
+-        /* perform GC here until !should_gc(ssd) */
+-        r = do_gc(ssd, true);
+-        if (r == -1)
+-            break;
++        force_gc(ssd);
+     }
+ 
+     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+@@ -833,19 +951,14 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+         }
+ 
+         /* new write */
+-        ppa = get_new_page(ssd);
++        ppa = get_new_page(ssd, USER_IO);
+         /* update maptbl */
+         set_maptbl_ent(ssd, lpn, &ppa);
+         /* update rmap */
+         set_rmap_ent(ssd, lpn, &ppa);
+ 
+-        mark_page_valid(ssd, &ppa);
+-
+-        /* need to advance the write pointer here */
+-        ssd_advance_write_pointer(ssd);
+-
+         struct nand_cmd swr;
+-        swr.type = USER_IO;
++        swr.type = req->io_type;
+         swr.cmd = NAND_WRITE;
+         swr.stime = req->stime;
+         /* get latency statistics */
+@@ -856,60 +969,942 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+     return maxlat;
+ }
+ 
+-static void *ftl_thread(void *arg)
++static inline void issue_request(struct ssd *ssd, NvmeRequest *req)
++{
++    int rc;
++
++    req->stime = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++
++    ftl_debug("Process IO: bg_id=%d, io_type=%s, opcode=%s, slba=%ld, nlb=%d\n",
++              le32_to_cpu(*((uint32_t *)&req->cmd.res2)),
++              req->io_type == FG_IO ? "FG" : "BG",
++              req->cmd.opcode == NVME_CMD_WRITE ? "Write" : "Read",
++              ((NvmeRwCmd *)&req->cmd)->slba,
++              ((NvmeRwCmd *)&req->cmd)->nlb + 1);
++    rc = femu_ring_enqueue(ssd->process_ring[req->sq->sqid], (void *)&req, 1);
++    if (rc != 1) {
++        ftl_err("FTL: process_ring enqueue failed\n");
++    }
++}
++
++static inline void do_fg_req(struct ssd *ssd, NvmeRequest *req)
++{
++    uint64_t lat = 0;
++
++    switch (req->cmd_opcode) {
++    case NVME_CMD_WRITE:
++        lat = ssd_write(ssd, req);
++        break;
++    case NVME_CMD_READ:
++        lat = ssd_read(ssd, req);
++        break;
++    default:
++        ftl_err("%s received unkown request type, ERROR\n", __func__);
++    }
++
++    if (lat) {
++        req->expire_time = req->stime + lat;
++    } else {
++        req->expire_time = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    }
++}
++
++static inline void update_idle_lun(struct ssd *ssd)
++{
++    struct ssdparams *spp = &ssd->sp;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    struct nand_lun *cur_lun;
++    uint32_t lun_id = 0;
++
++    ssd->idle_lun_count = 0;
++    for (int j = 0; j < spp->luns_per_ch; j++) {
++        for (int i = 0; i < spp->nchs; i++) {
++            cur_lun = &((&ssd->ch[i])->lun[j]);
++            if (cur_lun->next_lun_avail_time <= now) {
++                bitmap_set(ssd->idle_lun, lun_id++, 1);
++                ssd->idle_lun_count++;
++            } else {
++                bitmap_clear(ssd->idle_lun, lun_id++, 1);
++            }
++        }
++    }
++}
++
++static inline bool exist_idle(struct ssd *ssd)
++{
++    struct ssdparams *spp = &ssd->sp;
++    FemuCtrl *n = ssd->n;
++    bool ret = false;
++
++    ret = (qatomic_read(&n->pending_fg_nlbs) / spp->secs_per_pg) <
++          (int64_t)(ssd->idle_lun_count * ssd->idle_thre);
++
++    return ret;
++}
++
++static inline uint32_t qos_bg_write_pages(struct ssd *ssd, NvmeRequest *req)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct nand_lun *lunp;
++    uint32_t done_page = 0;
++    struct ppa ppa;
++
++    while (should_gc_high(ssd)) {
++        force_gc(ssd);
++    }
++
++    // 最多下发等同 lun 总数量的子请求
++    while (done_page < spp->tt_luns) {
++        ppa = get_maptbl_ent(ssd, req->write_lpn);
++        if (mapped_ppa(&ppa)) {
++            /* update old page information first */
++            mark_page_invalid(ssd, &ppa);
++            set_rmap_ent(ssd, INVALID_LPN, &ppa);
++        }
++
++        /* qos bg write */
++        ppa = get_new_page(ssd, BG_IO);
++        /* update maptbl */
++        set_maptbl_ent(ssd, req->write_lpn, &ppa);
++        /* update rmap */
++        set_rmap_ent(ssd, req->write_lpn, &ppa);
++
++        struct nand_cmd swr;
++        swr.type = QOS_BG_IO;
++        swr.cmd = NAND_WRITE;
++        swr.stime = 0;
++
++        ssd_advance_status(ssd, &ppa, &swr);
++        lunp = get_lun(ssd, &ppa);
++        if (req->max_subreq_expire_time < lunp->next_lun_avail_time) {
++            req->max_subreq_expire_time = lunp->next_lun_avail_time;
++        }
++
++        done_page++;
++        req->write_lpn++;
++        req->todo_subreq--;
++        if (req->todo_subreq == 0) {
++            req->expire_time = req->max_subreq_expire_time;
++            break;
++        }
++    }
++
++    return done_page;
++}
++
++static inline uint32_t qos_bg_read_pages(struct ssd *ssd, NvmeRequest *req)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct nand_lun *lunp;
++    uint32_t done_page = 0;
++    struct ppa ppa;
++
++    // 依次遍历每个 lun，下发一个子请求
++    for (uint32_t lun_id = 0; lun_id < spp->tt_luns; lun_id++) {
++        if (req->todo_subreq_per_lun[lun_id]) {
++            struct nand_cmd srd;
++            srd.type = QOS_BG_IO;
++            srd.cmd = NAND_READ;
++            srd.stime = 0;
++
++            ppa.ppa = 0;
++            ppa.g.ch = lun_id % spp->nchs;
++            ppa.g.lun = (lun_id / spp->nchs) % spp->luns_per_ch;
++            ppa.g.pl = lun_id / spp->tt_luns;
++            ftl_assert(ppa.g.pl == 0);
++            ppa.g.blk = 0;
++            ppa.g.pg = 0;
++
++            ssd_advance_status(ssd, &ppa, &srd);
++            lunp = get_lun(ssd, &ppa);
++            if (req->max_subreq_expire_time < lunp->next_lun_avail_time) {
++                req->max_subreq_expire_time = lunp->next_lun_avail_time;
++            }
++
++            done_page++;
++            req->todo_subreq_per_lun[lun_id]--;
++            req->todo_subreq--;
++            if (req->todo_subreq == 0) {
++                req->expire_time = req->max_subreq_expire_time;
++                free(req->todo_subreq_per_lun);
++                break;
++            }
++        }
++    }
++
++    return done_page;
++}
++
++static inline uint32_t do_qos_bg_req(struct ssd *ssd, NvmeRequest *req)
++{
++    uint32_t done_page = 0;
++
++    switch (req->cmd_opcode) {
++    case NVME_CMD_WRITE:
++        done_page = qos_bg_write_pages(ssd, req);
++        break;
++    case NVME_CMD_READ:
++        done_page = qos_bg_read_pages(ssd, req);
++        break;
++    default:
++        ftl_err("%s received unkown request type, ERROR\n", __func__);
++    }
++
++    return done_page;
++}
++
++static inline void bw_qos_bg(FemuCtrl *n)
++{
++    struct ssd *ssd = n->ssd;
++    struct BGManage *bg_manage = &n->bg_manage;
++    BGInfo *bg, *bg_next;
++    NvmeRequest *req, *req_next;
++    int64_t now;
++
++    // 依次选择后台任务
++    HASH_ITER(hh, bg_manage->hash_table, bg, bg_next)
++    {
++        // 跳过 DDL BG
++        if (bg->deadline) {
++            continue;
++        }
++
++        now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++        if (now >= bg->end_time) {
++            // 更新区间和统计量
++            bg->start_time = now - now % bg_manage->bw_diff_time;
++            bg->end_time = bg->start_time + bg_manage->bw_diff_time;
++            bg->issued_pages = 0;
++        }
++
++        // 依次处理后台 req
++        QTAILQ_FOREACH_SAFE(req, &bg->req_list, entry, req_next)
++        {
++            // 计算区间内的当前带宽和平均带宽
++            bg->cur_rw_bw =
++                PAGE_DIV_NS_FACTOR * bg->issued_pages / (now - bg->start_time);
++
++            if (bg->cur_rw_bw < bg->min_rw_bw) {
++                // 没有达到 QoS
++                uint32_t done_page = do_qos_bg_req(ssd, req);
++                bg->issued_pages += done_page;
++                ssd->qos_bg_pages += done_page;
++                bg_manage->bg_pending_pages -= done_page;
++                if (req->todo_subreq == 0) {
++                    QTAILQ_REMOVE(&bg->req_list, req, entry);
++                    issue_request(ssd, req);
++                } else {
++                    // 当前请求未完成，下次继续
++                    req_next = req;
++                }
++            } else {
++                // 当前 BG 已经满足 QoS
++                break;
++            }
++        }
++    }
++}
++
++static inline BGInfo *get_min_ddl_bg(FemuCtrl *n)
++{
++    struct BGManage *bg_manage = &n->bg_manage;
++    BGInfo *bg, *bg_next, *min_ddl_bg = NULL;
++    int64_t min_ddl = INT64_MAX, cur_ddl;
++    NvmeRequest *cur_req;
++
++    // 仅处理 DDL BG
++    QTAILQ_FOREACH_SAFE(bg, &bg_manage->ddl_bg_list, entry, bg_next)
++    {
++        cur_req = QTAILQ_FIRST(&bg->req_list);
++        if (cur_req) {
++            cur_ddl = cur_req->arrival_time + bg->deadline * (uint32_t)1e6;
++            if (min_ddl > cur_ddl) {
++                min_ddl_bg = bg;
++                min_ddl = cur_ddl;
++            }
++        }
++    }
++
++    return min_ddl_bg;
++}
++
++static inline void ddl_qos_bg(FemuCtrl *n)
++{
++    struct ssd *ssd = n->ssd;
++    struct BGManage *bg_manage = &n->bg_manage;
++    double min_rw_bw, cur_rw_bw;
++    int64_t now, start_time;
++
++    // DDL 转化成带宽控制
++    now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++
++    // 当前所在区间
++    bg_manage->cur_index =
++        now % (2 * MAX_DDL_NS) / bg_manage->ddl_diff_time;
++    start_time = now - now % bg_manage->ddl_diff_time;
++
++    // 初始化 last_index
++    if (unlikely(bg_manage->last_index == (uint32_t)-1)) {
++        bg_manage->last_index = bg_manage->cur_index;
++    }
++
++    // 更新区间和统计量
++    while (bg_manage->last_index != bg_manage->cur_index) {
++        bg_manage->ddl_pending_pages -=
++            bg_manage->issued_pages[bg_manage->last_index];
++        bg_manage->pending_pages[bg_manage->last_index] = 0;
++        bg_manage->issued_pages[bg_manage->last_index] = 0;
++        bg_manage->last_index++;
++        if (bg_manage->last_index == bg_manage->max_index) {
++            bg_manage->last_index = 0;
++        }
++    }
++
++    // 计算全局和当前区间的最低带宽
++    bg_manage->g_min_rw_bw = PAGE_DIV_NS_FACTOR *
++                                bg_manage->ddl_pending_pages /
++                                (bg_manage->cur_max_ddl - now);
++    bg_manage->ddl_min_rw_bg =
++        PAGE_DIV_NS_FACTOR *
++        bg_manage->pending_pages[bg_manage->cur_index] /
++        bg_manage->ddl_diff_time;
++
++    // 更新 DDL BG 应该维持的最小带宽
++    min_rw_bw = bg_manage->ddl_min_rw_bg;
++    if (min_rw_bw < bg_manage->g_min_rw_bw) {
++        min_rw_bw = bg_manage->g_min_rw_bw;
++    }
++
++    while (true) {
++        // 计算区间内的所有 DDL BG 的当前带宽和平均带宽
++        cur_rw_bw = PAGE_DIV_NS_FACTOR *
++                    bg_manage->issued_pages[bg_manage->cur_index] /
++                    (now - start_time);
++
++        if (cur_rw_bw < min_rw_bw) {
++            // 没有达到 QoS
++
++            // 取最小 DDL 进行处理
++            BGInfo *min_ddl_bg = get_min_ddl_bg(n);
++            if (min_ddl_bg == NULL) {
++                // 没有 DDL 请求了
++                break;
++            }
++
++            NvmeRequest *min_ddl_req = QTAILQ_FIRST(&min_ddl_bg->req_list);
++            uint32_t done_page = do_qos_bg_req(ssd, min_ddl_req);
++            bg_manage->issued_pages[bg_manage->cur_index] += done_page;
++            ssd->qos_bg_pages += done_page;
++            bg_manage->bg_pending_pages -= done_page;
++            if (min_ddl_req->todo_subreq == 0) {
++                QTAILQ_REMOVE(&min_ddl_bg->req_list, min_ddl_req, entry);
++                issue_request(ssd, min_ddl_req);
++            }
++        } else {
++            // DDL BG 已经满足 QoS
++            break;
++        }
++    }
++}
++
++static inline void limit_bg_cost(FemuCtrl *n)
+ {
+-    FemuCtrl *n = (FemuCtrl *)arg;
+     struct ssd *ssd = n->ssd;
++    struct BGManage *bg_manage = &n->bg_manage;
+     NvmeRequest *req = NULL;
+-    uint64_t lat = 0;
+-    int rc;
+-    int i;
++    BGInfo *bg = NULL;
++    uint32_t done_page = 0;
++    int64_t now;
++
++    while (bg_manage->bg_pending_pages > bg_manage->max_pending_pages) {
++        // RR 调度
++        bg = (bg_manage->last_picked == NULL) ? bg_manage->hash_table
++                                              : bg_manage->last_picked->hh.next;
++        bg_manage->last_picked = bg;
++        if (bg == NULL) {
++            continue;
++        }
+ 
+-    while (!*(ssd->dataplane_started_ptr)) {
+-        usleep(100000);
++        req = QTAILQ_FIRST(&bg->req_list);
++        if (req == NULL) {
++            continue;
++        }
++        done_page = do_qos_bg_req(ssd, req);
++        now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++        if (bg->deadline == 0) {
++            if (now >= bg->end_time) {
++                bg->start_time = now - now % bg_manage->bw_diff_time;
++                bg->end_time = bg->start_time + bg_manage->bw_diff_time;
++                bg->issued_pages = 0;
++            }
++            bg->issued_pages += done_page;
++        } else {
++            uint32_t ddl_index =
++                now % (2 * MAX_DDL_NS) / bg_manage->ddl_diff_time;
++            bg_manage->issued_pages[ddl_index] += done_page;
++        }
++        ssd->qos_bg_pages += done_page;
++        bg_manage->bg_pending_pages -= done_page;
++        if (req->todo_subreq == 0) {
++            QTAILQ_REMOVE(&bg->req_list, req, entry);
++            issue_request(ssd, req);
++        }
+     }
++}
+ 
+-    /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
+-    ssd->to_ftl = n->to_ftl;
+-    ssd->to_poller = n->to_poller;
++static void do_qos_bg(FemuCtrl *n)
++{
++    struct BGManage *bg_manage = &n->bg_manage;
+ 
+-    while (1) {
+-        for (i = 1; i <= n->num_poller; i++) {
+-            if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
+-                continue;
++    pthread_rwlock_wrlock(&bg_manage->rwlock);
+ 
+-            rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
+-            if (rc != 1) {
+-                printf("FEMU: FTL to_ftl dequeue failed\n");
++    // 尽力满足带宽 QoS 的 BG
++    bw_qos_bg(n);
++
++    // 尽力满足 DDL QoS 的 BG
++    ddl_qos_bg(n);
++
++    // 限制 BG 总量，减少开销
++    limit_bg_cost(n);
++
++    pthread_rwlock_unlock(&bg_manage->rwlock);
++}
++
++static void bg_preprocess(struct ssd *ssd, NvmeRequest *req)
++{
++    struct ssdparams *spp = &ssd->sp;
++    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
++    uint64_t slba = le64_to_cpu(rw->slba);
++    uint32_t nlb = le16_to_cpu(rw->nlb) + 1;
++    uint64_t start_lpn = slba / spp->secs_per_pg;
++    uint64_t end_lpn = (slba + nlb - 1) / spp->secs_per_pg;
++    uint32_t lun_id;
++    struct ppa ppa;
++
++    req->io_type = BG_IO;
++    req->todo_subreq = end_lpn - start_lpn + 1;
++    req->todo_subreq_per_lun = NULL;
++    req->write_lpn = start_lpn;
++    req->max_subreq_expire_time = 0;
++
++    if (req->cmd_opcode == NVME_CMD_READ) {
++        req->todo_subreq_per_lun = g_malloc0(sizeof(uint16_t) * spp->tt_luns);
++        for (uint64_t lpn = start_lpn; lpn <= end_lpn; lpn++) {
++            ppa = get_maptbl_ent(ssd, lpn);
++            if (!mapped_ppa(&ppa)) {
++                req->todo_subreq--;
++            } else {
++                lun_id =
++                    ppa.g.pl * spp->tt_luns + ppa.g.lun * spp->nchs + ppa.g.ch;
++                req->todo_subreq_per_lun[lun_id]++;
+             }
++        }
++    }
++}
++
++static inline struct ppa free_bg_get_page(struct ssd *ssd, uint32_t pg_id)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct write_pointer *wpp = &ssd->wp;
++    struct ppa ppa;
++
++    ppa.ppa = 0;
++    ppa.g.ch = pg_id % spp->nchs;
++    ppa.g.lun = (pg_id / spp->nchs) % spp->luns_per_ch;
++    ppa.g.pl = pg_id / spp->tt_luns;
++    ftl_assert(ppa.g.pl == 0);
++    ppa.g.blk = wpp->blk;
++    ppa.g.pg = wpp->pg;
++
++    bitmap_clear(wpp->free_pg, pg_id, 1);
++    mark_page_valid(ssd, &ppa);
+ 
+-            ftl_assert(req);
+-            switch (req->is_write) {
+-            case 1:
+-                lat = ssd_write(ssd, req);
++    if (bitmap_empty(wpp->free_pg, spp->tt_luns)) {
++        bitmap_fill(wpp->free_pg, spp->tt_luns);
++        wpp->pg++;
++        if (wpp->pg == spp->pgs_per_blk) {
++            ssd_advance_write_pointer(ssd, wpp);
++        }
++    }
++
++    return ppa;
++}
++
++static inline uint32_t free_bg_write_pages(struct ssd *ssd, NvmeRequest *req)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct write_pointer *wpp = &ssd->wp;
++    struct nand_lun *lunp;
++    uint32_t lun_id, done_page = 0;
++    struct ppa ppa;
++
++    ppa.ppa = 0;
++
++    // 先判断 lun 是否空闲，再判断 page 是否可写
++    lun_id = find_first_bit(ssd->idle_lun, spp->tt_luns);
++    while (lun_id < spp->tt_luns) {
++        if (test_bit(lun_id, wpp->free_pg)) {
++            ppa = get_maptbl_ent(ssd, req->write_lpn);
++            if (mapped_ppa(&ppa)) {
++                /* update old page information first */
++                mark_page_invalid(ssd, &ppa);
++                set_rmap_ent(ssd, INVALID_LPN, &ppa);
++            }
++
++            /* free bg write */
++            ppa = free_bg_get_page(ssd, lun_id);
++            /* update maptbl */
++            set_maptbl_ent(ssd, req->write_lpn, &ppa);
++            /* update rmap */
++            set_rmap_ent(ssd, req->write_lpn, &ppa);
++
++            struct nand_cmd swr;
++            swr.type = FREE_BG_IO;
++            swr.cmd = NAND_WRITE;
++            swr.stime = 0;
++
++            ssd_advance_status(ssd, &ppa, &swr);
++            lunp = get_lun(ssd, &ppa);
++            if (req->max_subreq_expire_time < lunp->next_lun_avail_time) {
++                req->max_subreq_expire_time = lunp->next_lun_avail_time;
++            }
++
++            done_page++;
++            bitmap_clear(ssd->idle_lun, lun_id, 1);
++            ssd->idle_lun_count--;
++            req->write_lpn++;
++            req->todo_subreq--;
++            if (req->todo_subreq == 0) {
++                req->expire_time = req->max_subreq_expire_time;
+                 break;
+-            case 0:
+-                lat = ssd_read(ssd, req);
++            }
++        }
++        lun_id = find_next_bit(ssd->idle_lun, spp->tt_luns, lun_id + 1);
++    }
++
++    return done_page;
++}
++
++static inline uint32_t free_bg_read_pages(struct ssd *ssd, NvmeRequest *req)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct nand_lun *lunp;
++    uint32_t lun_id, done_page = 0;
++    struct ppa ppa;
++
++    // 先判断 lun 是否空闲，再判断是否当前 lun 有读子请求
++    lun_id = find_first_bit(ssd->idle_lun, spp->tt_luns);
++    while (lun_id < spp->tt_luns) {
++        if (req->todo_subreq_per_lun[lun_id]) {
++            struct nand_cmd srd;
++            srd.type = FREE_BG_IO;
++            srd.cmd = NAND_READ;
++            srd.stime = 0;
++
++            ppa.ppa = 0;
++            ppa.g.ch = lun_id % spp->nchs;
++            ppa.g.lun = (lun_id / spp->nchs) % spp->luns_per_ch;
++            ppa.g.pl = lun_id / spp->tt_luns;
++            ftl_assert(ppa.g.pl == 0);
++            ppa.g.blk = 0;
++            ppa.g.pg = 0;
++
++            ssd_advance_status(ssd, &ppa, &srd);
++            lunp = get_lun(ssd, &ppa);
++            if (req->max_subreq_expire_time < lunp->next_lun_avail_time) {
++                req->max_subreq_expire_time = lunp->next_lun_avail_time;
++            }
++
++            done_page++;
++            bitmap_clear(ssd->idle_lun, lun_id, 1);
++            ssd->idle_lun_count--;
++            req->todo_subreq_per_lun[lun_id]--;
++            req->todo_subreq--;
++            if (req->todo_subreq == 0) {
++                req->expire_time = req->max_subreq_expire_time;
++                free(req->todo_subreq_per_lun);
+                 break;
+-            default:
+-                ftl_err("FTL received unkown request type, ERROR\n");
+             }
++        }
++        lun_id = find_next_bit(ssd->idle_lun, spp->tt_luns, lun_id + 1);
++    }
++
++    return done_page;
++}
++
++static inline uint32_t do_free_bg_req(struct ssd *ssd, NvmeRequest *req)
++{
++    uint32_t done_page = 0;
++
++    switch (req->cmd_opcode) {
++    case NVME_CMD_WRITE:
++        done_page = free_bg_write_pages(ssd, req);
++        break;
++    case NVME_CMD_READ:
++        done_page = free_bg_read_pages(ssd, req);
++        break;
++    default:
++        ftl_err("%s received unkown request type, ERROR\n", __func__);
++    }
++
++    return done_page;
++}
++
++static void do_free_bg(FemuCtrl *n)
++{
++    struct ssd *ssd = n->ssd;
++    struct ssdparams *spp = &ssd->sp;
++    struct BGManage *bg_manage = &n->bg_manage;
++    BGInfo *bg;
++    NvmeRequest *req = NULL, *req_next;
++    uint32_t done_page = 0;
++    int64_t now;
++
++    if (NULL == bg_manage->hash_table) {
++        return;
++    }
++
++    pthread_rwlock_wrlock(&bg_manage->rwlock);
++
++    // TODO: WRR 调度后台
++    while (true) {
++        // RR 调度
++        bg = (bg_manage->last_picked == NULL) ? bg_manage->hash_table
++                                              : bg_manage->last_picked->hh.next;
++        bg_manage->last_picked = bg;
++        if (bg == NULL) {
++            break;
++        }
++
++        now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++        if (now >= bg->end_time) {
++            // 更新区间和统计量
++            bg->start_time = now - now % bg_manage->bw_diff_time;
++            bg->end_time = bg->start_time + bg_manage->bw_diff_time;
++            bg->issued_pages = 0;
++        }
++
++        // 根据并行单元 lun 状态，调度后台 IO
++        QTAILQ_FOREACH_SAFE(req, &bg->req_list, entry, req_next)
++        {
++            if ((qatomic_read(&n->pending_fg_nlbs) / spp->secs_per_pg) >
++                (int64_t)(ssd->idle_lun_count * ssd->idle_thre)) {
++                // 不够空闲
++                pthread_rwlock_unlock(&bg_manage->rwlock);
++                return;
++            }
++
++            if (bg->id == FIO_ID) {
++                // 只限制 FIO BG 的带宽上限
++                bg->cur_rw_bw = PAGE_DIV_NS_FACTOR * bg->issued_pages /
++                                (now - bg->start_time);
++
++                if (bg->cur_rw_bw >= bg->max_rw_bw) {
++                    break;
++                }
++            }
++
++            done_page = do_free_bg_req(ssd, req);
++            if (done_page) {
++                // 机会调度也更新 issued_pages
++                int64_t now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++                if (bg->deadline == 0) {
++                    if (now >= bg->end_time) {
++                        bg->start_time = now - now % bg_manage->bw_diff_time;
++                        bg->end_time = bg->start_time + bg_manage->bw_diff_time;
++                        bg->issued_pages = 0;
++                    }
++                    bg->issued_pages += done_page;
++                } else {
++                    uint32_t ddl_index =
++                        now % (2 * MAX_DDL_NS) / bg_manage->ddl_diff_time;
++                    bg_manage->issued_pages[ddl_index] += done_page;
++                }
++                ssd->free_bg_pages += done_page;
++                bg_manage->bg_pending_pages -= done_page;
++            }
++
++            if (req->todo_subreq == 0) {
++                QTAILQ_REMOVE(&bg->req_list, req, entry);
++                issue_request(ssd, req);
++                ftl_debug("do free bg req from BG[%d:%s]\n", bg->id, bg->desc);
++            }
++        }
++    }
+ 
+-            req->reqlat = lat;
+-            req->expire_time += lat;
++    pthread_rwlock_unlock(&bg_manage->rwlock);
++}
++
++static struct ppa free_gc_get_page(struct ssd *ssd)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct gc_read_pointer *gc_rpp = &ssd->gc_rp;
++    struct nand_block *victim_blk = NULL;
++    uint32_t lun_id;
++    struct ppa ppa;
+ 
+-            rc = femu_ring_enqueue(ssd->to_poller[i], (void *)&req, 1);
++    ppa.ppa = 0;
++    ppa.g.blk = gc_rpp->gc_line->id;
++    ppa.g.pg = 0;
++
++    // 存在有效数据
++    lun_id = find_first_bit(gc_rpp->dirty_blk, spp->tt_luns);
++    while (lun_id < spp->tt_luns) {
++        // lun 空闲
++        if (test_bit(lun_id, ssd->idle_lun)) {
++            ppa.g.ch = lun_id % spp->nchs;
++            ppa.g.lun = (lun_id / spp->nchs) % spp->luns_per_ch;
++            ppa.g.pl = lun_id / spp->tt_luns;
++            ftl_assert(ppa.g.pl == 0);
++
++            bitmap_clear(ssd->idle_lun, lun_id, 1);
++            ssd->idle_lun_count--;
++            break;
++        }
++
++        lun_id = find_next_bit(gc_rpp->dirty_blk, spp->tt_luns, lun_id + 1);
++    }
++
++    if (lun_id == spp->tt_luns) {
++        ppa.ppa = INVALID_PPA;
++        return ppa;
++    }
++
++    victim_blk = get_blk(ssd, &ppa);
++    ppa.g.pg = find_first_bit(victim_blk->valid_pg, victim_blk->npgs);
++
++    return ppa;
++}
++
++static void free_gc(struct ssd *ssd)
++{
++    struct ssdparams *spp = &ssd->sp;
++    struct gc_read_pointer *gc_rpp = &ssd->gc_rp;
++    struct ppa ppa;
++
++    if (qemu_clock_get_us(QEMU_CLOCK_HOST) % 10 != 0) {
++        // 降低 free gc 频率为 1/10
++        return;
++    }
++
++    if (!gc_rpp->gc_line) {
++        gc_rpp->gc_line = select_victim_line(ssd, false);
++        if (!gc_rpp->gc_line) {
++            return;
++        }
++    }
++
++    ppa = free_gc_get_page(ssd);
++    if (ppa.ppa == INVALID_PPA) {
++        return;
++    }
++
++    ftl_debug("free_gc line:%d,ipc=%d,vpc=%d,victim=%d,full=%d,free=%d\n",
++              ppa.g.blk, gc_rpp->gc_line->ipc, gc_rpp->gc_line->vpc,
++              ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
++              ssd->lm.free_line_cnt);
++
++    if (ppa.g.pg != spp->pgs_per_blk) {
++        gc_read_page(ssd, &ppa);
++        gc_write_page(ssd, &ppa);
++        ftl_debug("do free gc read write page\n");
++    } else {
++        gc_erase_block(ssd, &ppa);
++        mark_block_free(ssd, &ppa);
++        bitmap_clear(gc_rpp->dirty_blk,
++                     ppa.g.pl * spp->tt_luns + ppa.g.lun * spp->nchs + ppa.g.ch,
++                     1);
++        ftl_debug("do free gc block[%d-%d] free\n", ppa.g.blk,
++                  ppa.g.pl * spp->tt_luns + ppa.g.lun * spp->nchs + ppa.g.ch);
++        if (bitmap_empty(gc_rpp->dirty_blk, spp->tt_luns)) {
++            mark_line_free(ssd, gc_rpp->gc_line);
++            ftl_debug("do free gc line free\n");
++            gc_rpp->gc_line = NULL;
++            bitmap_fill(gc_rpp->dirty_blk, spp->tt_luns);
++        }
++    }
++}
++
++static void *ftl_thread(void *arg)
++{
++    FemuCtrl *n = (FemuCtrl *)arg;
++    struct BGManage *bg_manage = &n->bg_manage;
++    struct ssd *ssd = n->ssd;
++    struct ssdparams *spp = &ssd->sp;
++    NvmeRequest *req = NULL;
++    BGInfo *bg;
++    int rc;
++
++    while (!n->dataplane_started) {
++        usleep(1000);
++    }
++
++    while (1) {
++        if (!n->dataplane_started) {
++            break;
++        }
++
++        if (femu_ring_count(n->ftl_ring[0])) {
++            rc = femu_ring_dequeue(n->ftl_ring[0], (void *)&req, 1);
+             if (rc != 1) {
+-                ftl_err("FTL to_poller enqueue failed\n");
++                ftl_err("FTL: ftl_ring dequeue failed\n");
+             }
+ 
+-            /* clean one line if needed (in the background) */
+-            if (should_gc(ssd)) {
+-                do_gc(ssd, false);
++            ftl_assert(req->io_type == USER_IO);
++
++            ftl_debug("bg_id=%u, opcode=%d, slba=%ld, nlb=%d\n",
++                        le32_to_cpu(*((uint32_t *)&req->cmd.res2)),
++                        req->cmd.opcode, ((NvmeRwCmd *)&req->cmd)->slba,
++                        ((NvmeRwCmd *)&req->cmd)->nlb + 1);
++
++            bg = find_bg(n, req->cmd.res2);
++            if ((!bg) || ((bg->id == COMPACTION_ID) &&
++                          (req->cmd_opcode == NVME_CMD_READ))) {
++                // FG IO 处理流程
++                req->io_type = FG_IO;
++                issue_request(ssd, req);
++                do_fg_req(ssd, req);
++                if (req->cmd.res2 == 0) {
++                    qatomic_sub(&n->pending_fg_nlbs, req->nlb);
++                }
++            } else {
++                // BG 预处理后，直接插入链表，然后处理下一个
++                bg_preprocess(ssd, req);
++                bg_manage->bg_pending_pages += req->nlb / spp->secs_per_pg;
++                if (bg->deadline) {
++                    int64_t ddl_time =
++                        req->arrival_time + bg->deadline * (uint32_t)1e6;
++                    uint32_t ddl_index =
++                        ddl_time % (2 * MAX_DDL_NS) / bg_manage->ddl_diff_time;
++                    bg_manage->ddl_pending_pages += req->nlb / spp->secs_per_pg;
++                    bg_manage->pending_pages[ddl_index] +=
++                        req->nlb / spp->secs_per_pg;
++                    if (ddl_time > bg_manage->cur_max_ddl) {
++                        bg_manage->cur_max_ddl = ddl_time;
++                    }
++                }
++                QTAILQ_INSERT_TAIL(&bg->req_list, req, entry);
++                continue;
+             }
+         }
++        else {
++            // 合理利用盘内剩余带宽
++            update_idle_lun(ssd);
++            if (exist_idle(ssd)) {
++                do_free_bg(n);
++                update_idle_lun(ssd);
++                if (exist_idle(ssd) && should_gc(ssd)) {
++                    free_gc(ssd);
++                }
++            }
++
++            if (0 == qatomic_read(&n->pending_fg_nlbs)) {
++                // 尽力保证 BG 的 QoS
++                do_qos_bg(n);
++            }
++        }
++    }
++
++    return NULL;
++}
++
++static inline void process_one_ring(FemuCtrl *n, int ring_index)
++{
++    struct ssd *ssd = n->ssd;
++    NvmeRequest *req = NULL;
++    int rc;
++
++    if (!ssd->process_ring[ring_index] ||
++        !femu_ring_count(ssd->process_ring[ring_index])) {
++        return;
++    }
++
++    rc = femu_ring_dequeue(ssd->process_ring[ring_index], (void *)&req, 1);
++    if (rc != 1) {
++        ftl_err("Process: process_ring dequeue failed\n");
++    }
++
++    req->status = nvme_io_cmd(n, &req->cmd, req);
++
++    rc = femu_ring_enqueue(n->cq_ring[ring_index], (void *)&req, 1);
++    if (rc != 1) {
++        ftl_err("Process: cq_ring enqueue failed\n");
++    }
++}
++
++static void *process_thread(void *args)
++{
++    FemuCtrl *n = ((FemuThreadArgument *)args)->n;
++    int index = ((FemuThreadArgument *)args)->index;
++
++    while (!n->dataplane_started) {
++        usleep(1000);
++    }
++
++    while (1) {
++        if (!n->dataplane_started) {
++            break;
++        }
++
++        for (int ring_index = index; ring_index <= n->num_io_queues;
++             ring_index += n->num_threads) {
++            process_one_ring(n, ring_index);
++        }
+     }
+ 
+     return NULL;
+ }
+ 
++static void *logging_thread(void *args)
++{
++    FemuCtrl *n = ((LogThreadArgument *)args)->n;
++    uint64_t **ring_buffer = ((LogThreadArgument *)args)->ring_buffer;
++    uint32_t data_len = ((LogThreadArgument *)args)->data_len;
++    uint32_t *head = ((LogThreadArgument *)args)->head;
++    uint32_t *tail = ((LogThreadArgument *)args)->tail;
++    const char *table_header = ((LogThreadArgument *)args)->table_header;
++    const char *file = ((LogThreadArgument *)args)->file;
++    FILE *fp = NULL;
++
++CHECK_FILE_LOG:
++    while (!(n->logging)) {
++        sleep(1);
++    }
++
++    fp = fopen(file, "a+");
++    if (fp == NULL) {
++        ftl_err("%s: Logfile open error!\n", file);
++        return NULL;
++    }
++    ftl_log("%s: Logging Start!\n", file);
++    fprintf(fp, "%s\n", table_header);
++    fflush(fp);
++
++    while (1) {
++        while ((*tail) != (*head)) {
++            if (ring_buffer[(*tail)][data_len] == DATA_INVALID) {
++                continue;
++            }
++            for (int i = 0; i < data_len; i++) {
++                if (i) {
++                    fprintf(fp, ",");
++                }
++                fprintf(fp, "%lu", ring_buffer[(*tail)][i]);
++            }
++            fprintf(fp, "\n");
++            ring_buffer[(*tail)][data_len] = DATA_INVALID;
++            if (++(*tail) == LOGGING_RING_BUF_MAX) {
++                *tail = 0;
++            }
++        }
++        fflush(fp);
++
++        if (n->logging) {
++            usleep(10);
++        } else {
++            fclose(fp);
++            ftl_log("%s: Logging Stop!\n", file);
++            goto CHECK_FILE_LOG;
++        }
++    }
++}
+diff --git a/hw/block/femu/bbssd/ftl.h b/hw/block/femu/bbssd/ftl.h
+index 791f85d73..a29c74dc7 100644
+--- a/hw/block/femu/bbssd/ftl.h
++++ b/hw/block/femu/bbssd/ftl.h
+@@ -12,14 +12,9 @@ enum {
+     NAND_WRITE = 1,
+     NAND_ERASE = 2,
+ 
+-    NAND_READ_LATENCY = 40000,
+-    NAND_PROG_LATENCY = 200000,
+-    NAND_ERASE_LATENCY = 2000000,
+-};
+-
+-enum {
+-    USER_IO = 0,
+-    GC_IO = 1,
++    NAND_READ_LATENCY = 50000,
++    NAND_PROG_LATENCY = 500000,
++    NAND_ERASE_LATENCY = 5000000,
+ };
+ 
+ enum {
+@@ -40,8 +35,13 @@ enum {
+     FEMU_DISABLE_DELAY_EMU = 4,
+ 
+     FEMU_RESET_ACCT = 5,
+-    FEMU_ENABLE_LOG = 6,
+-    FEMU_DISABLE_LOG = 7,
++    FEMU_ENABLE_LOGGING = 6,
++    FEMU_DISABLE_LOGGING = 7,
++    FEMU_ENABLE_BG_DELAY = 8,
++    FEMU_DISABLE_BG_DELAY = 9,
++    FEMU_HUFU_DEBUG = 10,
++    FEMU_INFO_PRINTF = 11,
++    FEMU_IDLE_THRE = 12
+ };
+ 
+ 
+@@ -84,6 +84,7 @@ struct nand_block {
+     int vpc; /* valid page count */
+     int erase_cnt;
+     int wp; /* current write pointer */
++    unsigned long *valid_pg;
+ };
+ 
+ struct nand_plane {
+@@ -96,7 +97,6 @@ struct nand_lun {
+     int npls;
+     uint64_t next_lun_avail_time;
+     bool busy;
+-    uint64_t gc_endtime;
+ };
+ 
+ struct ssd_channel {
+@@ -104,7 +104,6 @@ struct ssd_channel {
+     int nluns;
+     uint64_t next_ch_avail_time;
+     bool busy;
+-    uint64_t gc_endtime;
+ };
+ 
+ struct ssdparams {
+@@ -128,6 +127,7 @@ struct ssdparams {
+     double gc_thres_pcent_high;
+     int gc_thres_lines_high;
+     bool enable_gc_delay;
++    bool enable_bg_delay;
+ 
+     /* below are all calculated values */
+     int secs_per_blk; /* # of sectors per block */
+@@ -168,11 +168,14 @@ typedef struct line {
+ /* wp: record next write addr */
+ struct write_pointer {
+     struct line *curline;
+-    int ch;
+-    int lun;
+-    int pg;
+     int blk;
+-    int pl;
++    int pg;
++    unsigned long *free_pg;
++};
++
++struct gc_read_pointer {
++    struct line *gc_line;
++    unsigned long *dirty_blk;
+ };
+ 
+ struct line_mgmt {
+@@ -195,21 +198,42 @@ struct nand_cmd {
+ };
+ 
+ struct ssd {
++    FemuCtrl *n;
+     char *ssdname;
+     struct ssdparams sp;
+     struct ssd_channel *ch;
+     struct ppa *maptbl; /* page level mapping table */
+     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
+     struct write_pointer wp;
++    struct write_pointer gc_wp;
++    struct gc_read_pointer gc_rp;
+     struct line_mgmt lm;
+ 
+-    /* lockless ring for communication with NVMe IO thread */
+-    struct rte_ring **to_ftl;
+-    struct rte_ring **to_poller;
+-    bool *dataplane_started_ptr;
+     QemuThread ftl_thread;
++    QemuThread *process_thread;
++    struct rte_ring **process_ring;
++
++    bool *logging;
++
++    double idle_thre;
++    unsigned long *idle_lun;
++    uint32_t idle_lun_count;
++
++    uint64_t free_bg_pages;
++    uint64_t qos_bg_pages;
++
++    uint64_t nand_end_time;
++    uint64_t nand_read_pgs;
++    uint64_t nand_write_pgs;
++    uint64_t nand_erase_blks;
++    uint64_t gc_read_pgs;
++    uint64_t gc_write_pgs;
++    uint64_t gc_erase_blks;
+ };
+ 
++// 100ms
++#define NAND_DIFF_TIME (100000000)
++
+ void ssd_init(FemuCtrl *n);
+ 
+ #ifdef FEMU_DEBUG_FTL
+diff --git a/hw/block/femu/femu.c b/hw/block/femu/femu.c
+index 7e0b8de61..9a817b055 100644
+--- a/hw/block/femu/femu.c
++++ b/hw/block/femu/femu.c
+@@ -544,6 +544,10 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
+     n->aer_reqs = g_malloc0(sizeof(*n->aer_reqs) * (n->aerl + 1));
+     n->features.int_vector_config = g_malloc0(sizeof(*n->features.int_vector_config) * (n->num_io_queues + 1));
+ 
++    n->pending_fg_nlbs = 0;
++
++    bg_manage_init(n);
++
+     nvme_init_pci(n);
+     nvme_init_ctrl(n);
+     nvme_init_namespaces(n, errp);
+@@ -559,14 +563,17 @@ static void nvme_destroy_poller(FemuCtrl *n)
+ {
+     femu_debug("Destroying NVMe poller !!\n");
+ 
+-    for (int i = 1; i <= n->num_poller; i++) {
+-        qemu_thread_join(&n->poller[i]);
++    for (int i = 0; i <= n->num_io_queues; i++) {
++        qemu_thread_join(&n->sq_thread[i]);
++        qemu_thread_join(&n->cq_thread[i]);
+     }
+ 
+-    for (int i = 1; i <= n->num_poller; i++) {
+-        pqueue_free(n->pq[i]);
+-        femu_ring_free(n->to_poller[i]);
+-        femu_ring_free(n->to_ftl[i]);
++    for (int i = 0; i <= n->num_io_queues; i++) {
++        if (i) {
++            pqueue_free(n->pq[i]);
++        }
++        femu_ring_free(n->ftl_ring[i]);
++        femu_ring_free(n->cq_ring[i]);
+     }
+ 
+     g_free(n->should_isr);
+@@ -603,9 +610,9 @@ static Property femu_props[] = {
+     DEFINE_PROP_STRING("serial", FemuCtrl, serial),
+     DEFINE_PROP_UINT32("devsz_mb", FemuCtrl, memsz, 1024), /* in MB */
+     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
+-    DEFINE_PROP_UINT32("queues", FemuCtrl, num_io_queues, 8),
++    DEFINE_PROP_UINT32("queues", FemuCtrl, num_io_queues, 16),
++    DEFINE_PROP_UINT32("threads", FemuCtrl, num_threads, 4),
+     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
+-    DEFINE_PROP_UINT8("multipoller_enabled", FemuCtrl, multipoller_enabled, 0),
+     DEFINE_PROP_UINT8("max_cqes", FemuCtrl, max_cqes, 0x4),
+     DEFINE_PROP_UINT8("max_sqes", FemuCtrl, max_sqes, 0x6),
+     DEFINE_PROP_UINT8("stride", FemuCtrl, db_stride, 0),
+@@ -633,7 +640,7 @@ static Property femu_props[] = {
+     DEFINE_PROP_UINT32("cmbsz", FemuCtrl, cmbsz, 0),
+     DEFINE_PROP_UINT32("cmbloc", FemuCtrl, cmbloc, 0),
+     DEFINE_PROP_UINT16("oacs", FemuCtrl, oacs, NVME_OACS_FORMAT),
+-    DEFINE_PROP_UINT16("oncs", FemuCtrl, oncs, NVME_ONCS_DSM),
++    DEFINE_PROP_UINT16("oncs", FemuCtrl, oncs, 0),
+     DEFINE_PROP_UINT16("vid", FemuCtrl, vid, 0x1d1d),
+     DEFINE_PROP_UINT16("did", FemuCtrl, did, 0x1f1f),
+     DEFINE_PROP_UINT8("femu_mode", FemuCtrl, femu_mode, FEMU_NOSSD_MODE),
+diff --git a/hw/block/femu/inc/uthash.h b/hw/block/femu/inc/uthash.h
+new file mode 100644
+index 000000000..81eb6c1d5
+--- /dev/null
++++ b/hw/block/femu/inc/uthash.h
+@@ -0,0 +1,1136 @@
++/*
++Copyright (c) 2003-2021, Troy D. Hanson     http://troydhanson.github.com/uthash/
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
++IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
++OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#ifndef UTHASH_H
++#define UTHASH_H
++
++#define UTHASH_VERSION 2.3.0
++
++#include <string.h>   /* memcmp, memset, strlen */
++#include <stddef.h>   /* ptrdiff_t */
++#include <stdlib.h>   /* exit */
++
++#if defined(HASH_DEFINE_OWN_STDINT) && HASH_DEFINE_OWN_STDINT
++/* This codepath is provided for backward compatibility, but I plan to remove it. */
++#warning "HASH_DEFINE_OWN_STDINT is deprecated; please use HASH_NO_STDINT instead"
++typedef unsigned int uint32_t;
++typedef unsigned char uint8_t;
++#elif defined(HASH_NO_STDINT) && HASH_NO_STDINT
++#else
++#include <stdint.h>   /* uint8_t, uint32_t */
++#endif
++
++/* These macros use decltype or the earlier __typeof GNU extension.
++   As decltype is only available in newer compilers (VS2010 or gcc 4.3+
++   when compiling c++ source) this code uses whatever method is needed
++   or, for VS2008 where neither is available, uses casting workarounds. */
++#if !defined(DECLTYPE) && !defined(NO_DECLTYPE)
++#if defined(_MSC_VER)   /* MS compiler */
++#if _MSC_VER >= 1600 && defined(__cplusplus)  /* VS2010 or newer in C++ mode */
++#define DECLTYPE(x) (decltype(x))
++#else                   /* VS2008 or older (or VS2010 in C mode) */
++#define NO_DECLTYPE
++#endif
++#elif defined(__BORLANDC__) || defined(__ICCARM__) || defined(__LCC__) || defined(__WATCOMC__)
++#define NO_DECLTYPE
++#else                   /* GNU, Sun and other compilers */
++#define DECLTYPE(x) (__typeof(x))
++#endif
++#endif
++
++#ifdef NO_DECLTYPE
++#define DECLTYPE(x)
++#define DECLTYPE_ASSIGN(dst,src)                                                 \
++do {                                                                             \
++  char **_da_dst = (char**)(&(dst));                                             \
++  *_da_dst = (char*)(src);                                                       \
++} while (0)
++#else
++#define DECLTYPE_ASSIGN(dst,src)                                                 \
++do {                                                                             \
++  (dst) = DECLTYPE(dst)(src);                                                    \
++} while (0)
++#endif
++
++#ifndef uthash_malloc
++#define uthash_malloc(sz) malloc(sz)      /* malloc fcn                      */
++#endif
++#ifndef uthash_free
++#define uthash_free(ptr,sz) free(ptr)     /* free fcn                        */
++#endif
++#ifndef uthash_bzero
++#define uthash_bzero(a,n) memset(a,'\0',n)
++#endif
++#ifndef uthash_strlen
++#define uthash_strlen(s) strlen(s)
++#endif
++
++#ifndef HASH_FUNCTION
++#define HASH_FUNCTION(keyptr,keylen,hashv) HASH_JEN(keyptr, keylen, hashv)
++#endif
++
++#ifndef HASH_KEYCMP
++#define HASH_KEYCMP(a,b,n) memcmp(a,b,n)
++#endif
++
++#ifndef uthash_noexpand_fyi
++#define uthash_noexpand_fyi(tbl)          /* can be defined to log noexpand  */
++#endif
++#ifndef uthash_expand_fyi
++#define uthash_expand_fyi(tbl)            /* can be defined to log expands   */
++#endif
++
++#ifndef HASH_NONFATAL_OOM
++#define HASH_NONFATAL_OOM 0
++#endif
++
++#if HASH_NONFATAL_OOM
++/* malloc failures can be recovered from */
++
++#ifndef uthash_nonfatal_oom
++#define uthash_nonfatal_oom(obj) do {} while (0)    /* non-fatal OOM error */
++#endif
++
++#define HASH_RECORD_OOM(oomed) do { (oomed) = 1; } while (0)
++#define IF_HASH_NONFATAL_OOM(x) x
++
++#else
++/* malloc failures result in lost memory, hash tables are unusable */
++
++#ifndef uthash_fatal
++#define uthash_fatal(msg) exit(-1)        /* fatal OOM error */
++#endif
++
++#define HASH_RECORD_OOM(oomed) uthash_fatal("out of memory")
++#define IF_HASH_NONFATAL_OOM(x)
++
++#endif
++
++/* initial number of buckets */
++#define HASH_INITIAL_NUM_BUCKETS 32U     /* initial number of buckets        */
++#define HASH_INITIAL_NUM_BUCKETS_LOG2 5U /* lg2 of initial number of buckets */
++#define HASH_BKT_CAPACITY_THRESH 10U     /* expand when bucket count reaches */
++
++/* calculate the element whose hash handle address is hhp */
++#define ELMT_FROM_HH(tbl,hhp) ((void*)(((char*)(hhp)) - ((tbl)->hho)))
++/* calculate the hash handle from element address elp */
++#define HH_FROM_ELMT(tbl,elp) ((UT_hash_handle*)(void*)(((char*)(elp)) + ((tbl)->hho)))
++
++#define HASH_ROLLBACK_BKT(hh, head, itemptrhh)                                   \
++do {                                                                             \
++  struct UT_hash_handle *_hd_hh_item = (itemptrhh);                              \
++  unsigned _hd_bkt;                                                              \
++  HASH_TO_BKT(_hd_hh_item->hashv, (head)->hh.tbl->num_buckets, _hd_bkt);         \
++  (head)->hh.tbl->buckets[_hd_bkt].count++;                                      \
++  _hd_hh_item->hh_next = NULL;                                                   \
++  _hd_hh_item->hh_prev = NULL;                                                   \
++} while (0)
++
++#define HASH_VALUE(keyptr,keylen,hashv)                                          \
++do {                                                                             \
++  HASH_FUNCTION(keyptr, keylen, hashv);                                          \
++} while (0)
++
++#define HASH_FIND_BYHASHVALUE(hh,head,keyptr,keylen,hashval,out)                 \
++do {                                                                             \
++  (out) = NULL;                                                                  \
++  if (head) {                                                                    \
++    unsigned _hf_bkt;                                                            \
++    HASH_TO_BKT(hashval, (head)->hh.tbl->num_buckets, _hf_bkt);                  \
++    if (HASH_BLOOM_TEST((head)->hh.tbl, hashval) != 0) {                         \
++      HASH_FIND_IN_BKT((head)->hh.tbl, hh, (head)->hh.tbl->buckets[ _hf_bkt ], keyptr, keylen, hashval, out); \
++    }                                                                            \
++  }                                                                              \
++} while (0)
++
++#define HASH_FIND(hh,head,keyptr,keylen,out)                                     \
++do {                                                                             \
++  (out) = NULL;                                                                  \
++  if (head) {                                                                    \
++    unsigned _hf_hashv;                                                          \
++    HASH_VALUE(keyptr, keylen, _hf_hashv);                                       \
++    HASH_FIND_BYHASHVALUE(hh, head, keyptr, keylen, _hf_hashv, out);             \
++  }                                                                              \
++} while (0)
++
++#ifdef HASH_BLOOM
++#define HASH_BLOOM_BITLEN (1UL << HASH_BLOOM)
++#define HASH_BLOOM_BYTELEN (HASH_BLOOM_BITLEN/8UL) + (((HASH_BLOOM_BITLEN%8UL)!=0UL) ? 1UL : 0UL)
++#define HASH_BLOOM_MAKE(tbl,oomed)                                               \
++do {                                                                             \
++  (tbl)->bloom_nbits = HASH_BLOOM;                                               \
++  (tbl)->bloom_bv = (uint8_t*)uthash_malloc(HASH_BLOOM_BYTELEN);                 \
++  if (!(tbl)->bloom_bv) {                                                        \
++    HASH_RECORD_OOM(oomed);                                                      \
++  } else {                                                                       \
++    uthash_bzero((tbl)->bloom_bv, HASH_BLOOM_BYTELEN);                           \
++    (tbl)->bloom_sig = HASH_BLOOM_SIGNATURE;                                     \
++  }                                                                              \
++} while (0)
++
++#define HASH_BLOOM_FREE(tbl)                                                     \
++do {                                                                             \
++  uthash_free((tbl)->bloom_bv, HASH_BLOOM_BYTELEN);                              \
++} while (0)
++
++#define HASH_BLOOM_BITSET(bv,idx) (bv[(idx)/8U] |= (1U << ((idx)%8U)))
++#define HASH_BLOOM_BITTEST(bv,idx) (bv[(idx)/8U] & (1U << ((idx)%8U)))
++
++#define HASH_BLOOM_ADD(tbl,hashv)                                                \
++  HASH_BLOOM_BITSET((tbl)->bloom_bv, ((hashv) & (uint32_t)((1UL << (tbl)->bloom_nbits) - 1U)))
++
++#define HASH_BLOOM_TEST(tbl,hashv)                                               \
++  HASH_BLOOM_BITTEST((tbl)->bloom_bv, ((hashv) & (uint32_t)((1UL << (tbl)->bloom_nbits) - 1U)))
++
++#else
++#define HASH_BLOOM_MAKE(tbl,oomed)
++#define HASH_BLOOM_FREE(tbl)
++#define HASH_BLOOM_ADD(tbl,hashv)
++#define HASH_BLOOM_TEST(tbl,hashv) (1)
++#define HASH_BLOOM_BYTELEN 0U
++#endif
++
++#define HASH_MAKE_TABLE(hh,head,oomed)                                           \
++do {                                                                             \
++  (head)->hh.tbl = (UT_hash_table*)uthash_malloc(sizeof(UT_hash_table));         \
++  if (!(head)->hh.tbl) {                                                         \
++    HASH_RECORD_OOM(oomed);                                                      \
++  } else {                                                                       \
++    uthash_bzero((head)->hh.tbl, sizeof(UT_hash_table));                         \
++    (head)->hh.tbl->tail = &((head)->hh);                                        \
++    (head)->hh.tbl->num_buckets = HASH_INITIAL_NUM_BUCKETS;                      \
++    (head)->hh.tbl->log2_num_buckets = HASH_INITIAL_NUM_BUCKETS_LOG2;            \
++    (head)->hh.tbl->hho = (char*)(&(head)->hh) - (char*)(head);                  \
++    (head)->hh.tbl->buckets = (UT_hash_bucket*)uthash_malloc(                    \
++        HASH_INITIAL_NUM_BUCKETS * sizeof(struct UT_hash_bucket));               \
++    (head)->hh.tbl->signature = HASH_SIGNATURE;                                  \
++    if (!(head)->hh.tbl->buckets) {                                              \
++      HASH_RECORD_OOM(oomed);                                                    \
++      uthash_free((head)->hh.tbl, sizeof(UT_hash_table));                        \
++    } else {                                                                     \
++      uthash_bzero((head)->hh.tbl->buckets,                                      \
++          HASH_INITIAL_NUM_BUCKETS * sizeof(struct UT_hash_bucket));             \
++      HASH_BLOOM_MAKE((head)->hh.tbl, oomed);                                    \
++      IF_HASH_NONFATAL_OOM(                                                      \
++        if (oomed) {                                                             \
++          uthash_free((head)->hh.tbl->buckets,                                   \
++              HASH_INITIAL_NUM_BUCKETS*sizeof(struct UT_hash_bucket));           \
++          uthash_free((head)->hh.tbl, sizeof(UT_hash_table));                    \
++        }                                                                        \
++      )                                                                          \
++    }                                                                            \
++  }                                                                              \
++} while (0)
++
++#define HASH_REPLACE_BYHASHVALUE_INORDER(hh,head,fieldname,keylen_in,hashval,add,replaced,cmpfcn) \
++do {                                                                             \
++  (replaced) = NULL;                                                             \
++  HASH_FIND_BYHASHVALUE(hh, head, &((add)->fieldname), keylen_in, hashval, replaced); \
++  if (replaced) {                                                                \
++    HASH_DELETE(hh, head, replaced);                                             \
++  }                                                                              \
++  HASH_ADD_KEYPTR_BYHASHVALUE_INORDER(hh, head, &((add)->fieldname), keylen_in, hashval, add, cmpfcn); \
++} while (0)
++
++#define HASH_REPLACE_BYHASHVALUE(hh,head,fieldname,keylen_in,hashval,add,replaced) \
++do {                                                                             \
++  (replaced) = NULL;                                                             \
++  HASH_FIND_BYHASHVALUE(hh, head, &((add)->fieldname), keylen_in, hashval, replaced); \
++  if (replaced) {                                                                \
++    HASH_DELETE(hh, head, replaced);                                             \
++  }                                                                              \
++  HASH_ADD_KEYPTR_BYHASHVALUE(hh, head, &((add)->fieldname), keylen_in, hashval, add); \
++} while (0)
++
++#define HASH_REPLACE(hh,head,fieldname,keylen_in,add,replaced)                   \
++do {                                                                             \
++  unsigned _hr_hashv;                                                            \
++  HASH_VALUE(&((add)->fieldname), keylen_in, _hr_hashv);                         \
++  HASH_REPLACE_BYHASHVALUE(hh, head, fieldname, keylen_in, _hr_hashv, add, replaced); \
++} while (0)
++
++#define HASH_REPLACE_INORDER(hh,head,fieldname,keylen_in,add,replaced,cmpfcn)    \
++do {                                                                             \
++  unsigned _hr_hashv;                                                            \
++  HASH_VALUE(&((add)->fieldname), keylen_in, _hr_hashv);                         \
++  HASH_REPLACE_BYHASHVALUE_INORDER(hh, head, fieldname, keylen_in, _hr_hashv, add, replaced, cmpfcn); \
++} while (0)
++
++#define HASH_APPEND_LIST(hh, head, add)                                          \
++do {                                                                             \
++  (add)->hh.next = NULL;                                                         \
++  (add)->hh.prev = ELMT_FROM_HH((head)->hh.tbl, (head)->hh.tbl->tail);           \
++  (head)->hh.tbl->tail->next = (add);                                            \
++  (head)->hh.tbl->tail = &((add)->hh);                                           \
++} while (0)
++
++#define HASH_AKBI_INNER_LOOP(hh,head,add,cmpfcn)                                 \
++do {                                                                             \
++  do {                                                                           \
++    if (cmpfcn(DECLTYPE(head)(_hs_iter), add) > 0) {                             \
++      break;                                                                     \
++    }                                                                            \
++  } while ((_hs_iter = HH_FROM_ELMT((head)->hh.tbl, _hs_iter)->next));           \
++} while (0)
++
++#ifdef NO_DECLTYPE
++#undef HASH_AKBI_INNER_LOOP
++#define HASH_AKBI_INNER_LOOP(hh,head,add,cmpfcn)                                 \
++do {                                                                             \
++  char *_hs_saved_head = (char*)(head);                                          \
++  do {                                                                           \
++    DECLTYPE_ASSIGN(head, _hs_iter);                                             \
++    if (cmpfcn(head, add) > 0) {                                                 \
++      DECLTYPE_ASSIGN(head, _hs_saved_head);                                     \
++      break;                                                                     \
++    }                                                                            \
++    DECLTYPE_ASSIGN(head, _hs_saved_head);                                       \
++  } while ((_hs_iter = HH_FROM_ELMT((head)->hh.tbl, _hs_iter)->next));           \
++} while (0)
++#endif
++
++#if HASH_NONFATAL_OOM
++
++#define HASH_ADD_TO_TABLE(hh,head,keyptr,keylen_in,hashval,add,oomed)            \
++do {                                                                             \
++  if (!(oomed)) {                                                                \
++    unsigned _ha_bkt;                                                            \
++    (head)->hh.tbl->num_items++;                                                 \
++    HASH_TO_BKT(hashval, (head)->hh.tbl->num_buckets, _ha_bkt);                  \
++    HASH_ADD_TO_BKT((head)->hh.tbl->buckets[_ha_bkt], hh, &(add)->hh, oomed);    \
++    if (oomed) {                                                                 \
++      HASH_ROLLBACK_BKT(hh, head, &(add)->hh);                                   \
++      HASH_DELETE_HH(hh, head, &(add)->hh);                                      \
++      (add)->hh.tbl = NULL;                                                      \
++      uthash_nonfatal_oom(add);                                                  \
++    } else {                                                                     \
++      HASH_BLOOM_ADD((head)->hh.tbl, hashval);                                   \
++      HASH_EMIT_KEY(hh, head, keyptr, keylen_in);                                \
++    }                                                                            \
++  } else {                                                                       \
++    (add)->hh.tbl = NULL;                                                        \
++    uthash_nonfatal_oom(add);                                                    \
++  }                                                                              \
++} while (0)
++
++#else
++
++#define HASH_ADD_TO_TABLE(hh,head,keyptr,keylen_in,hashval,add,oomed)            \
++do {                                                                             \
++  unsigned _ha_bkt;                                                              \
++  (head)->hh.tbl->num_items++;                                                   \
++  HASH_TO_BKT(hashval, (head)->hh.tbl->num_buckets, _ha_bkt);                    \
++  HASH_ADD_TO_BKT((head)->hh.tbl->buckets[_ha_bkt], hh, &(add)->hh, oomed);      \
++  HASH_BLOOM_ADD((head)->hh.tbl, hashval);                                       \
++  HASH_EMIT_KEY(hh, head, keyptr, keylen_in);                                    \
++} while (0)
++
++#endif
++
++
++#define HASH_ADD_KEYPTR_BYHASHVALUE_INORDER(hh,head,keyptr,keylen_in,hashval,add,cmpfcn) \
++do {                                                                             \
++  IF_HASH_NONFATAL_OOM( int _ha_oomed = 0; )                                     \
++  (add)->hh.hashv = (hashval);                                                   \
++  (add)->hh.key = (char*) (keyptr);                                              \
++  (add)->hh.keylen = (unsigned) (keylen_in);                                     \
++  if (!(head)) {                                                                 \
++    (add)->hh.next = NULL;                                                       \
++    (add)->hh.prev = NULL;                                                       \
++    HASH_MAKE_TABLE(hh, add, _ha_oomed);                                         \
++    IF_HASH_NONFATAL_OOM( if (!_ha_oomed) { )                                    \
++      (head) = (add);                                                            \
++    IF_HASH_NONFATAL_OOM( } )                                                    \
++  } else {                                                                       \
++    void *_hs_iter = (head);                                                     \
++    (add)->hh.tbl = (head)->hh.tbl;                                              \
++    HASH_AKBI_INNER_LOOP(hh, head, add, cmpfcn);                                 \
++    if (_hs_iter) {                                                              \
++      (add)->hh.next = _hs_iter;                                                 \
++      if (((add)->hh.prev = HH_FROM_ELMT((head)->hh.tbl, _hs_iter)->prev)) {     \
++        HH_FROM_ELMT((head)->hh.tbl, (add)->hh.prev)->next = (add);              \
++      } else {                                                                   \
++        (head) = (add);                                                          \
++      }                                                                          \
++      HH_FROM_ELMT((head)->hh.tbl, _hs_iter)->prev = (add);                      \
++    } else {                                                                     \
++      HASH_APPEND_LIST(hh, head, add);                                           \
++    }                                                                            \
++  }                                                                              \
++  HASH_ADD_TO_TABLE(hh, head, keyptr, keylen_in, hashval, add, _ha_oomed);       \
++  HASH_FSCK(hh, head, "HASH_ADD_KEYPTR_BYHASHVALUE_INORDER");                    \
++} while (0)
++
++#define HASH_ADD_KEYPTR_INORDER(hh,head,keyptr,keylen_in,add,cmpfcn)             \
++do {                                                                             \
++  unsigned _hs_hashv;                                                            \
++  HASH_VALUE(keyptr, keylen_in, _hs_hashv);                                      \
++  HASH_ADD_KEYPTR_BYHASHVALUE_INORDER(hh, head, keyptr, keylen_in, _hs_hashv, add, cmpfcn); \
++} while (0)
++
++#define HASH_ADD_BYHASHVALUE_INORDER(hh,head,fieldname,keylen_in,hashval,add,cmpfcn) \
++  HASH_ADD_KEYPTR_BYHASHVALUE_INORDER(hh, head, &((add)->fieldname), keylen_in, hashval, add, cmpfcn)
++
++#define HASH_ADD_INORDER(hh,head,fieldname,keylen_in,add,cmpfcn)                 \
++  HASH_ADD_KEYPTR_INORDER(hh, head, &((add)->fieldname), keylen_in, add, cmpfcn)
++
++#define HASH_ADD_KEYPTR_BYHASHVALUE(hh,head,keyptr,keylen_in,hashval,add)        \
++do {                                                                             \
++  IF_HASH_NONFATAL_OOM( int _ha_oomed = 0; )                                     \
++  (add)->hh.hashv = (hashval);                                                   \
++  (add)->hh.key = (const void*) (keyptr);                                        \
++  (add)->hh.keylen = (unsigned) (keylen_in);                                     \
++  if (!(head)) {                                                                 \
++    (add)->hh.next = NULL;                                                       \
++    (add)->hh.prev = NULL;                                                       \
++    HASH_MAKE_TABLE(hh, add, _ha_oomed);                                         \
++    IF_HASH_NONFATAL_OOM( if (!_ha_oomed) { )                                    \
++      (head) = (add);                                                            \
++    IF_HASH_NONFATAL_OOM( } )                                                    \
++  } else {                                                                       \
++    (add)->hh.tbl = (head)->hh.tbl;                                              \
++    HASH_APPEND_LIST(hh, head, add);                                             \
++  }                                                                              \
++  HASH_ADD_TO_TABLE(hh, head, keyptr, keylen_in, hashval, add, _ha_oomed);       \
++  HASH_FSCK(hh, head, "HASH_ADD_KEYPTR_BYHASHVALUE");                            \
++} while (0)
++
++#define HASH_ADD_KEYPTR(hh,head,keyptr,keylen_in,add)                            \
++do {                                                                             \
++  unsigned _ha_hashv;                                                            \
++  HASH_VALUE(keyptr, keylen_in, _ha_hashv);                                      \
++  HASH_ADD_KEYPTR_BYHASHVALUE(hh, head, keyptr, keylen_in, _ha_hashv, add);      \
++} while (0)
++
++#define HASH_ADD_BYHASHVALUE(hh,head,fieldname,keylen_in,hashval,add)            \
++  HASH_ADD_KEYPTR_BYHASHVALUE(hh, head, &((add)->fieldname), keylen_in, hashval, add)
++
++#define HASH_ADD(hh,head,fieldname,keylen_in,add)                                \
++  HASH_ADD_KEYPTR(hh, head, &((add)->fieldname), keylen_in, add)
++
++#define HASH_TO_BKT(hashv,num_bkts,bkt)                                          \
++do {                                                                             \
++  bkt = ((hashv) & ((num_bkts) - 1U));                                           \
++} while (0)
++
++/* delete "delptr" from the hash table.
++ * "the usual" patch-up process for the app-order doubly-linked-list.
++ * The use of _hd_hh_del below deserves special explanation.
++ * These used to be expressed using (delptr) but that led to a bug
++ * if someone used the same symbol for the head and deletee, like
++ *  HASH_DELETE(hh,users,users);
++ * We want that to work, but by changing the head (users) below
++ * we were forfeiting our ability to further refer to the deletee (users)
++ * in the patch-up process. Solution: use scratch space to
++ * copy the deletee pointer, then the latter references are via that
++ * scratch pointer rather than through the repointed (users) symbol.
++ */
++#define HASH_DELETE(hh,head,delptr)                                              \
++    HASH_DELETE_HH(hh, head, &(delptr)->hh)
++
++#define HASH_DELETE_HH(hh,head,delptrhh)                                         \
++do {                                                                             \
++  struct UT_hash_handle *_hd_hh_del = (delptrhh);                                \
++  if ((_hd_hh_del->prev == NULL) && (_hd_hh_del->next == NULL)) {                \
++    HASH_BLOOM_FREE((head)->hh.tbl);                                             \
++    uthash_free((head)->hh.tbl->buckets,                                         \
++                (head)->hh.tbl->num_buckets * sizeof(struct UT_hash_bucket));    \
++    uthash_free((head)->hh.tbl, sizeof(UT_hash_table));                          \
++    (head) = NULL;                                                               \
++  } else {                                                                       \
++    unsigned _hd_bkt;                                                            \
++    if (_hd_hh_del == (head)->hh.tbl->tail) {                                    \
++      (head)->hh.tbl->tail = HH_FROM_ELMT((head)->hh.tbl, _hd_hh_del->prev);     \
++    }                                                                            \
++    if (_hd_hh_del->prev != NULL) {                                              \
++      HH_FROM_ELMT((head)->hh.tbl, _hd_hh_del->prev)->next = _hd_hh_del->next;   \
++    } else {                                                                     \
++      DECLTYPE_ASSIGN(head, _hd_hh_del->next);                                   \
++    }                                                                            \
++    if (_hd_hh_del->next != NULL) {                                              \
++      HH_FROM_ELMT((head)->hh.tbl, _hd_hh_del->next)->prev = _hd_hh_del->prev;   \
++    }                                                                            \
++    HASH_TO_BKT(_hd_hh_del->hashv, (head)->hh.tbl->num_buckets, _hd_bkt);        \
++    HASH_DEL_IN_BKT((head)->hh.tbl->buckets[_hd_bkt], _hd_hh_del);               \
++    (head)->hh.tbl->num_items--;                                                 \
++  }                                                                              \
++  HASH_FSCK(hh, head, "HASH_DELETE_HH");                                         \
++} while (0)
++
++/* convenience forms of HASH_FIND/HASH_ADD/HASH_DEL */
++#define HASH_FIND_STR(head,findstr,out)                                          \
++do {                                                                             \
++    unsigned _uthash_hfstr_keylen = (unsigned)uthash_strlen(findstr);            \
++    HASH_FIND(hh, head, findstr, _uthash_hfstr_keylen, out);                     \
++} while (0)
++#define HASH_ADD_STR(head,strfield,add)                                          \
++do {                                                                             \
++    unsigned _uthash_hastr_keylen = (unsigned)uthash_strlen((add)->strfield);    \
++    HASH_ADD(hh, head, strfield[0], _uthash_hastr_keylen, add);                  \
++} while (0)
++#define HASH_REPLACE_STR(head,strfield,add,replaced)                             \
++do {                                                                             \
++    unsigned _uthash_hrstr_keylen = (unsigned)uthash_strlen((add)->strfield);    \
++    HASH_REPLACE(hh, head, strfield[0], _uthash_hrstr_keylen, add, replaced);    \
++} while (0)
++#define HASH_FIND_INT(head,findint,out)                                          \
++    HASH_FIND(hh,head,findint,sizeof(int),out)
++#define HASH_ADD_INT(head,intfield,add)                                          \
++    HASH_ADD(hh,head,intfield,sizeof(int),add)
++#define HASH_REPLACE_INT(head,intfield,add,replaced)                             \
++    HASH_REPLACE(hh,head,intfield,sizeof(int),add,replaced)
++#define HASH_FIND_PTR(head,findptr,out)                                          \
++    HASH_FIND(hh,head,findptr,sizeof(void *),out)
++#define HASH_ADD_PTR(head,ptrfield,add)                                          \
++    HASH_ADD(hh,head,ptrfield,sizeof(void *),add)
++#define HASH_REPLACE_PTR(head,ptrfield,add,replaced)                             \
++    HASH_REPLACE(hh,head,ptrfield,sizeof(void *),add,replaced)
++#define HASH_DEL(head,delptr)                                                    \
++    HASH_DELETE(hh,head,delptr)
++
++/* HASH_FSCK checks hash integrity on every add/delete when HASH_DEBUG is defined.
++ * This is for uthash developer only; it compiles away if HASH_DEBUG isn't defined.
++ */
++#ifdef HASH_DEBUG
++#include <stdio.h>   /* fprintf, stderr */
++#define HASH_OOPS(...) do { fprintf(stderr, __VA_ARGS__); exit(-1); } while (0)
++#define HASH_FSCK(hh,head,where)                                                 \
++do {                                                                             \
++  struct UT_hash_handle *_thh;                                                   \
++  if (head) {                                                                    \
++    unsigned _bkt_i;                                                             \
++    unsigned _count = 0;                                                         \
++    char *_prev;                                                                 \
++    for (_bkt_i = 0; _bkt_i < (head)->hh.tbl->num_buckets; ++_bkt_i) {           \
++      unsigned _bkt_count = 0;                                                   \
++      _thh = (head)->hh.tbl->buckets[_bkt_i].hh_head;                            \
++      _prev = NULL;                                                              \
++      while (_thh) {                                                             \
++        if (_prev != (char*)(_thh->hh_prev)) {                                   \
++          HASH_OOPS("%s: invalid hh_prev %p, actual %p\n",                       \
++              (where), (void*)_thh->hh_prev, (void*)_prev);                      \
++        }                                                                        \
++        _bkt_count++;                                                            \
++        _prev = (char*)(_thh);                                                   \
++        _thh = _thh->hh_next;                                                    \
++      }                                                                          \
++      _count += _bkt_count;                                                      \
++      if ((head)->hh.tbl->buckets[_bkt_i].count !=  _bkt_count) {                \
++        HASH_OOPS("%s: invalid bucket count %u, actual %u\n",                    \
++            (where), (head)->hh.tbl->buckets[_bkt_i].count, _bkt_count);         \
++      }                                                                          \
++    }                                                                            \
++    if (_count != (head)->hh.tbl->num_items) {                                   \
++      HASH_OOPS("%s: invalid hh item count %u, actual %u\n",                     \
++          (where), (head)->hh.tbl->num_items, _count);                           \
++    }                                                                            \
++    _count = 0;                                                                  \
++    _prev = NULL;                                                                \
++    _thh =  &(head)->hh;                                                         \
++    while (_thh) {                                                               \
++      _count++;                                                                  \
++      if (_prev != (char*)_thh->prev) {                                          \
++        HASH_OOPS("%s: invalid prev %p, actual %p\n",                            \
++            (where), (void*)_thh->prev, (void*)_prev);                           \
++      }                                                                          \
++      _prev = (char*)ELMT_FROM_HH((head)->hh.tbl, _thh);                         \
++      _thh = (_thh->next ? HH_FROM_ELMT((head)->hh.tbl, _thh->next) : NULL);     \
++    }                                                                            \
++    if (_count != (head)->hh.tbl->num_items) {                                   \
++      HASH_OOPS("%s: invalid app item count %u, actual %u\n",                    \
++          (where), (head)->hh.tbl->num_items, _count);                           \
++    }                                                                            \
++  }                                                                              \
++} while (0)
++#else
++#define HASH_FSCK(hh,head,where)
++#endif
++
++/* When compiled with -DHASH_EMIT_KEYS, length-prefixed keys are emitted to
++ * the descriptor to which this macro is defined for tuning the hash function.
++ * The app can #include <unistd.h> to get the prototype for write(2). */
++#ifdef HASH_EMIT_KEYS
++#define HASH_EMIT_KEY(hh,head,keyptr,fieldlen)                                   \
++do {                                                                             \
++  unsigned _klen = fieldlen;                                                     \
++  write(HASH_EMIT_KEYS, &_klen, sizeof(_klen));                                  \
++  write(HASH_EMIT_KEYS, keyptr, (unsigned long)fieldlen);                        \
++} while (0)
++#else
++#define HASH_EMIT_KEY(hh,head,keyptr,fieldlen)
++#endif
++
++/* The Bernstein hash function, used in Perl prior to v5.6. Note (x<<5+x)=x*33. */
++#define HASH_BER(key,keylen,hashv)                                               \
++do {                                                                             \
++  unsigned _hb_keylen = (unsigned)keylen;                                        \
++  const unsigned char *_hb_key = (const unsigned char*)(key);                    \
++  (hashv) = 0;                                                                   \
++  while (_hb_keylen-- != 0U) {                                                   \
++    (hashv) = (((hashv) << 5) + (hashv)) + *_hb_key++;                           \
++  }                                                                              \
++} while (0)
++
++
++/* SAX/FNV/OAT/JEN hash functions are macro variants of those listed at
++ * http://eternallyconfuzzled.com/tuts/algorithms/jsw_tut_hashing.aspx */
++#define HASH_SAX(key,keylen,hashv)                                               \
++do {                                                                             \
++  unsigned _sx_i;                                                                \
++  const unsigned char *_hs_key = (const unsigned char*)(key);                    \
++  hashv = 0;                                                                     \
++  for (_sx_i=0; _sx_i < keylen; _sx_i++) {                                       \
++    hashv ^= (hashv << 5) + (hashv >> 2) + _hs_key[_sx_i];                       \
++  }                                                                              \
++} while (0)
++/* FNV-1a variation */
++#define HASH_FNV(key,keylen,hashv)                                               \
++do {                                                                             \
++  unsigned _fn_i;                                                                \
++  const unsigned char *_hf_key = (const unsigned char*)(key);                    \
++  (hashv) = 2166136261U;                                                         \
++  for (_fn_i=0; _fn_i < keylen; _fn_i++) {                                       \
++    hashv = hashv ^ _hf_key[_fn_i];                                              \
++    hashv = hashv * 16777619U;                                                   \
++  }                                                                              \
++} while (0)
++
++#define HASH_OAT(key,keylen,hashv)                                               \
++do {                                                                             \
++  unsigned _ho_i;                                                                \
++  const unsigned char *_ho_key=(const unsigned char*)(key);                      \
++  hashv = 0;                                                                     \
++  for(_ho_i=0; _ho_i < keylen; _ho_i++) {                                        \
++      hashv += _ho_key[_ho_i];                                                   \
++      hashv += (hashv << 10);                                                    \
++      hashv ^= (hashv >> 6);                                                     \
++  }                                                                              \
++  hashv += (hashv << 3);                                                         \
++  hashv ^= (hashv >> 11);                                                        \
++  hashv += (hashv << 15);                                                        \
++} while (0)
++
++#define HASH_JEN_MIX(a,b,c)                                                      \
++do {                                                                             \
++  a -= b; a -= c; a ^= ( c >> 13 );                                              \
++  b -= c; b -= a; b ^= ( a << 8 );                                               \
++  c -= a; c -= b; c ^= ( b >> 13 );                                              \
++  a -= b; a -= c; a ^= ( c >> 12 );                                              \
++  b -= c; b -= a; b ^= ( a << 16 );                                              \
++  c -= a; c -= b; c ^= ( b >> 5 );                                               \
++  a -= b; a -= c; a ^= ( c >> 3 );                                               \
++  b -= c; b -= a; b ^= ( a << 10 );                                              \
++  c -= a; c -= b; c ^= ( b >> 15 );                                              \
++} while (0)
++
++#define HASH_JEN(key,keylen,hashv)                                               \
++do {                                                                             \
++  unsigned _hj_i,_hj_j,_hj_k;                                                    \
++  unsigned const char *_hj_key=(unsigned const char*)(key);                      \
++  hashv = 0xfeedbeefu;                                                           \
++  _hj_i = _hj_j = 0x9e3779b9u;                                                   \
++  _hj_k = (unsigned)(keylen);                                                    \
++  while (_hj_k >= 12U) {                                                         \
++    _hj_i +=    (_hj_key[0] + ( (unsigned)_hj_key[1] << 8 )                      \
++        + ( (unsigned)_hj_key[2] << 16 )                                         \
++        + ( (unsigned)_hj_key[3] << 24 ) );                                      \
++    _hj_j +=    (_hj_key[4] + ( (unsigned)_hj_key[5] << 8 )                      \
++        + ( (unsigned)_hj_key[6] << 16 )                                         \
++        + ( (unsigned)_hj_key[7] << 24 ) );                                      \
++    hashv += (_hj_key[8] + ( (unsigned)_hj_key[9] << 8 )                         \
++        + ( (unsigned)_hj_key[10] << 16 )                                        \
++        + ( (unsigned)_hj_key[11] << 24 ) );                                     \
++                                                                                 \
++     HASH_JEN_MIX(_hj_i, _hj_j, hashv);                                          \
++                                                                                 \
++     _hj_key += 12;                                                              \
++     _hj_k -= 12U;                                                               \
++  }                                                                              \
++  hashv += (unsigned)(keylen);                                                   \
++  switch ( _hj_k ) {                                                             \
++    case 11: hashv += ( (unsigned)_hj_key[10] << 24 ); /* FALLTHROUGH */         \
++    case 10: hashv += ( (unsigned)_hj_key[9] << 16 );  /* FALLTHROUGH */         \
++    case 9:  hashv += ( (unsigned)_hj_key[8] << 8 );   /* FALLTHROUGH */         \
++    case 8:  _hj_j += ( (unsigned)_hj_key[7] << 24 );  /* FALLTHROUGH */         \
++    case 7:  _hj_j += ( (unsigned)_hj_key[6] << 16 );  /* FALLTHROUGH */         \
++    case 6:  _hj_j += ( (unsigned)_hj_key[5] << 8 );   /* FALLTHROUGH */         \
++    case 5:  _hj_j += _hj_key[4];                      /* FALLTHROUGH */         \
++    case 4:  _hj_i += ( (unsigned)_hj_key[3] << 24 );  /* FALLTHROUGH */         \
++    case 3:  _hj_i += ( (unsigned)_hj_key[2] << 16 );  /* FALLTHROUGH */         \
++    case 2:  _hj_i += ( (unsigned)_hj_key[1] << 8 );   /* FALLTHROUGH */         \
++    case 1:  _hj_i += _hj_key[0];                      /* FALLTHROUGH */         \
++    default: ;                                                                   \
++  }                                                                              \
++  HASH_JEN_MIX(_hj_i, _hj_j, hashv);                                             \
++} while (0)
++
++/* The Paul Hsieh hash function */
++#undef get16bits
++#if (defined(__GNUC__) && defined(__i386__)) || defined(__WATCOMC__)             \
++  || defined(_MSC_VER) || defined (__BORLANDC__) || defined (__TURBOC__)
++#define get16bits(d) (*((const uint16_t *) (d)))
++#endif
++
++#if !defined (get16bits)
++#define get16bits(d) ((((uint32_t)(((const uint8_t *)(d))[1])) << 8)             \
++                       +(uint32_t)(((const uint8_t *)(d))[0]) )
++#endif
++#define HASH_SFH(key,keylen,hashv)                                               \
++do {                                                                             \
++  unsigned const char *_sfh_key=(unsigned const char*)(key);                     \
++  uint32_t _sfh_tmp, _sfh_len = (uint32_t)keylen;                                \
++                                                                                 \
++  unsigned _sfh_rem = _sfh_len & 3U;                                             \
++  _sfh_len >>= 2;                                                                \
++  hashv = 0xcafebabeu;                                                           \
++                                                                                 \
++  /* Main loop */                                                                \
++  for (;_sfh_len > 0U; _sfh_len--) {                                             \
++    hashv    += get16bits (_sfh_key);                                            \
++    _sfh_tmp  = ((uint32_t)(get16bits (_sfh_key+2)) << 11) ^ hashv;              \
++    hashv     = (hashv << 16) ^ _sfh_tmp;                                        \
++    _sfh_key += 2U*sizeof (uint16_t);                                            \
++    hashv    += hashv >> 11;                                                     \
++  }                                                                              \
++                                                                                 \
++  /* Handle end cases */                                                         \
++  switch (_sfh_rem) {                                                            \
++    case 3: hashv += get16bits (_sfh_key);                                       \
++            hashv ^= hashv << 16;                                                \
++            hashv ^= (uint32_t)(_sfh_key[sizeof (uint16_t)]) << 18;              \
++            hashv += hashv >> 11;                                                \
++            break;                                                               \
++    case 2: hashv += get16bits (_sfh_key);                                       \
++            hashv ^= hashv << 11;                                                \
++            hashv += hashv >> 17;                                                \
++            break;                                                               \
++    case 1: hashv += *_sfh_key;                                                  \
++            hashv ^= hashv << 10;                                                \
++            hashv += hashv >> 1;                                                 \
++            break;                                                               \
++    default: ;                                                                   \
++  }                                                                              \
++                                                                                 \
++  /* Force "avalanching" of final 127 bits */                                    \
++  hashv ^= hashv << 3;                                                           \
++  hashv += hashv >> 5;                                                           \
++  hashv ^= hashv << 4;                                                           \
++  hashv += hashv >> 17;                                                          \
++  hashv ^= hashv << 25;                                                          \
++  hashv += hashv >> 6;                                                           \
++} while (0)
++
++/* iterate over items in a known bucket to find desired item */
++#define HASH_FIND_IN_BKT(tbl,hh,head,keyptr,keylen_in,hashval,out)               \
++do {                                                                             \
++  if ((head).hh_head != NULL) {                                                  \
++    DECLTYPE_ASSIGN(out, ELMT_FROM_HH(tbl, (head).hh_head));                     \
++  } else {                                                                       \
++    (out) = NULL;                                                                \
++  }                                                                              \
++  while ((out) != NULL) {                                                        \
++    if ((out)->hh.hashv == (hashval) && (out)->hh.keylen == (keylen_in)) {       \
++      if (HASH_KEYCMP((out)->hh.key, keyptr, keylen_in) == 0) {                  \
++        break;                                                                   \
++      }                                                                          \
++    }                                                                            \
++    if ((out)->hh.hh_next != NULL) {                                             \
++      DECLTYPE_ASSIGN(out, ELMT_FROM_HH(tbl, (out)->hh.hh_next));                \
++    } else {                                                                     \
++      (out) = NULL;                                                              \
++    }                                                                            \
++  }                                                                              \
++} while (0)
++
++/* add an item to a bucket  */
++#define HASH_ADD_TO_BKT(head,hh,addhh,oomed)                                     \
++do {                                                                             \
++  UT_hash_bucket *_ha_head = &(head);                                            \
++  _ha_head->count++;                                                             \
++  (addhh)->hh_next = _ha_head->hh_head;                                          \
++  (addhh)->hh_prev = NULL;                                                       \
++  if (_ha_head->hh_head != NULL) {                                               \
++    _ha_head->hh_head->hh_prev = (addhh);                                        \
++  }                                                                              \
++  _ha_head->hh_head = (addhh);                                                   \
++  if ((_ha_head->count >= ((_ha_head->expand_mult + 1U) * HASH_BKT_CAPACITY_THRESH)) \
++      && !(addhh)->tbl->noexpand) {                                              \
++    HASH_EXPAND_BUCKETS(addhh,(addhh)->tbl, oomed);                              \
++    IF_HASH_NONFATAL_OOM(                                                        \
++      if (oomed) {                                                               \
++        HASH_DEL_IN_BKT(head,addhh);                                             \
++      }                                                                          \
++    )                                                                            \
++  }                                                                              \
++} while (0)
++
++/* remove an item from a given bucket */
++#define HASH_DEL_IN_BKT(head,delhh)                                              \
++do {                                                                             \
++  UT_hash_bucket *_hd_head = &(head);                                            \
++  _hd_head->count--;                                                             \
++  if (_hd_head->hh_head == (delhh)) {                                            \
++    _hd_head->hh_head = (delhh)->hh_next;                                        \
++  }                                                                              \
++  if ((delhh)->hh_prev) {                                                        \
++    (delhh)->hh_prev->hh_next = (delhh)->hh_next;                                \
++  }                                                                              \
++  if ((delhh)->hh_next) {                                                        \
++    (delhh)->hh_next->hh_prev = (delhh)->hh_prev;                                \
++  }                                                                              \
++} while (0)
++
++/* Bucket expansion has the effect of doubling the number of buckets
++ * and redistributing the items into the new buckets. Ideally the
++ * items will distribute more or less evenly into the new buckets
++ * (the extent to which this is true is a measure of the quality of
++ * the hash function as it applies to the key domain).
++ *
++ * With the items distributed into more buckets, the chain length
++ * (item count) in each bucket is reduced. Thus by expanding buckets
++ * the hash keeps a bound on the chain length. This bounded chain
++ * length is the essence of how a hash provides constant time lookup.
++ *
++ * The calculation of tbl->ideal_chain_maxlen below deserves some
++ * explanation. First, keep in mind that we're calculating the ideal
++ * maximum chain length based on the *new* (doubled) bucket count.
++ * In fractions this is just n/b (n=number of items,b=new num buckets).
++ * Since the ideal chain length is an integer, we want to calculate
++ * ceil(n/b). We don't depend on floating point arithmetic in this
++ * hash, so to calculate ceil(n/b) with integers we could write
++ *
++ *      ceil(n/b) = (n/b) + ((n%b)?1:0)
++ *
++ * and in fact a previous version of this hash did just that.
++ * But now we have improved things a bit by recognizing that b is
++ * always a power of two. We keep its base 2 log handy (call it lb),
++ * so now we can write this with a bit shift and logical AND:
++ *
++ *      ceil(n/b) = (n>>lb) + ( (n & (b-1)) ? 1:0)
++ *
++ */
++#define HASH_EXPAND_BUCKETS(hh,tbl,oomed)                                        \
++do {                                                                             \
++  unsigned _he_bkt;                                                              \
++  unsigned _he_bkt_i;                                                            \
++  struct UT_hash_handle *_he_thh, *_he_hh_nxt;                                   \
++  UT_hash_bucket *_he_new_buckets, *_he_newbkt;                                  \
++  _he_new_buckets = (UT_hash_bucket*)uthash_malloc(                              \
++           sizeof(struct UT_hash_bucket) * (tbl)->num_buckets * 2U);             \
++  if (!_he_new_buckets) {                                                        \
++    HASH_RECORD_OOM(oomed);                                                      \
++  } else {                                                                       \
++    uthash_bzero(_he_new_buckets,                                                \
++        sizeof(struct UT_hash_bucket) * (tbl)->num_buckets * 2U);                \
++    (tbl)->ideal_chain_maxlen =                                                  \
++       ((tbl)->num_items >> ((tbl)->log2_num_buckets+1U)) +                      \
++       ((((tbl)->num_items & (((tbl)->num_buckets*2U)-1U)) != 0U) ? 1U : 0U);    \
++    (tbl)->nonideal_items = 0;                                                   \
++    for (_he_bkt_i = 0; _he_bkt_i < (tbl)->num_buckets; _he_bkt_i++) {           \
++      _he_thh = (tbl)->buckets[ _he_bkt_i ].hh_head;                             \
++      while (_he_thh != NULL) {                                                  \
++        _he_hh_nxt = _he_thh->hh_next;                                           \
++        HASH_TO_BKT(_he_thh->hashv, (tbl)->num_buckets * 2U, _he_bkt);           \
++        _he_newbkt = &(_he_new_buckets[_he_bkt]);                                \
++        if (++(_he_newbkt->count) > (tbl)->ideal_chain_maxlen) {                 \
++          (tbl)->nonideal_items++;                                               \
++          if (_he_newbkt->count > _he_newbkt->expand_mult * (tbl)->ideal_chain_maxlen) { \
++            _he_newbkt->expand_mult++;                                           \
++          }                                                                      \
++        }                                                                        \
++        _he_thh->hh_prev = NULL;                                                 \
++        _he_thh->hh_next = _he_newbkt->hh_head;                                  \
++        if (_he_newbkt->hh_head != NULL) {                                       \
++          _he_newbkt->hh_head->hh_prev = _he_thh;                                \
++        }                                                                        \
++        _he_newbkt->hh_head = _he_thh;                                           \
++        _he_thh = _he_hh_nxt;                                                    \
++      }                                                                          \
++    }                                                                            \
++    uthash_free((tbl)->buckets, (tbl)->num_buckets * sizeof(struct UT_hash_bucket)); \
++    (tbl)->num_buckets *= 2U;                                                    \
++    (tbl)->log2_num_buckets++;                                                   \
++    (tbl)->buckets = _he_new_buckets;                                            \
++    (tbl)->ineff_expands = ((tbl)->nonideal_items > ((tbl)->num_items >> 1)) ?   \
++        ((tbl)->ineff_expands+1U) : 0U;                                          \
++    if ((tbl)->ineff_expands > 1U) {                                             \
++      (tbl)->noexpand = 1;                                                       \
++      uthash_noexpand_fyi(tbl);                                                  \
++    }                                                                            \
++    uthash_expand_fyi(tbl);                                                      \
++  }                                                                              \
++} while (0)
++
++
++/* This is an adaptation of Simon Tatham's O(n log(n)) mergesort */
++/* Note that HASH_SORT assumes the hash handle name to be hh.
++ * HASH_SRT was added to allow the hash handle name to be passed in. */
++#define HASH_SORT(head,cmpfcn) HASH_SRT(hh,head,cmpfcn)
++#define HASH_SRT(hh,head,cmpfcn)                                                 \
++do {                                                                             \
++  unsigned _hs_i;                                                                \
++  unsigned _hs_looping,_hs_nmerges,_hs_insize,_hs_psize,_hs_qsize;               \
++  struct UT_hash_handle *_hs_p, *_hs_q, *_hs_e, *_hs_list, *_hs_tail;            \
++  if (head != NULL) {                                                            \
++    _hs_insize = 1;                                                              \
++    _hs_looping = 1;                                                             \
++    _hs_list = &((head)->hh);                                                    \
++    while (_hs_looping != 0U) {                                                  \
++      _hs_p = _hs_list;                                                          \
++      _hs_list = NULL;                                                           \
++      _hs_tail = NULL;                                                           \
++      _hs_nmerges = 0;                                                           \
++      while (_hs_p != NULL) {                                                    \
++        _hs_nmerges++;                                                           \
++        _hs_q = _hs_p;                                                           \
++        _hs_psize = 0;                                                           \
++        for (_hs_i = 0; _hs_i < _hs_insize; ++_hs_i) {                           \
++          _hs_psize++;                                                           \
++          _hs_q = ((_hs_q->next != NULL) ?                                       \
++            HH_FROM_ELMT((head)->hh.tbl, _hs_q->next) : NULL);                   \
++          if (_hs_q == NULL) {                                                   \
++            break;                                                               \
++          }                                                                      \
++        }                                                                        \
++        _hs_qsize = _hs_insize;                                                  \
++        while ((_hs_psize != 0U) || ((_hs_qsize != 0U) && (_hs_q != NULL))) {    \
++          if (_hs_psize == 0U) {                                                 \
++            _hs_e = _hs_q;                                                       \
++            _hs_q = ((_hs_q->next != NULL) ?                                     \
++              HH_FROM_ELMT((head)->hh.tbl, _hs_q->next) : NULL);                 \
++            _hs_qsize--;                                                         \
++          } else if ((_hs_qsize == 0U) || (_hs_q == NULL)) {                     \
++            _hs_e = _hs_p;                                                       \
++            if (_hs_p != NULL) {                                                 \
++              _hs_p = ((_hs_p->next != NULL) ?                                   \
++                HH_FROM_ELMT((head)->hh.tbl, _hs_p->next) : NULL);               \
++            }                                                                    \
++            _hs_psize--;                                                         \
++          } else if ((cmpfcn(                                                    \
++                DECLTYPE(head)(ELMT_FROM_HH((head)->hh.tbl, _hs_p)),             \
++                DECLTYPE(head)(ELMT_FROM_HH((head)->hh.tbl, _hs_q))              \
++                )) <= 0) {                                                       \
++            _hs_e = _hs_p;                                                       \
++            if (_hs_p != NULL) {                                                 \
++              _hs_p = ((_hs_p->next != NULL) ?                                   \
++                HH_FROM_ELMT((head)->hh.tbl, _hs_p->next) : NULL);               \
++            }                                                                    \
++            _hs_psize--;                                                         \
++          } else {                                                               \
++            _hs_e = _hs_q;                                                       \
++            _hs_q = ((_hs_q->next != NULL) ?                                     \
++              HH_FROM_ELMT((head)->hh.tbl, _hs_q->next) : NULL);                 \
++            _hs_qsize--;                                                         \
++          }                                                                      \
++          if ( _hs_tail != NULL ) {                                              \
++            _hs_tail->next = ((_hs_e != NULL) ?                                  \
++              ELMT_FROM_HH((head)->hh.tbl, _hs_e) : NULL);                       \
++          } else {                                                               \
++            _hs_list = _hs_e;                                                    \
++          }                                                                      \
++          if (_hs_e != NULL) {                                                   \
++            _hs_e->prev = ((_hs_tail != NULL) ?                                  \
++              ELMT_FROM_HH((head)->hh.tbl, _hs_tail) : NULL);                    \
++          }                                                                      \
++          _hs_tail = _hs_e;                                                      \
++        }                                                                        \
++        _hs_p = _hs_q;                                                           \
++      }                                                                          \
++      if (_hs_tail != NULL) {                                                    \
++        _hs_tail->next = NULL;                                                   \
++      }                                                                          \
++      if (_hs_nmerges <= 1U) {                                                   \
++        _hs_looping = 0;                                                         \
++        (head)->hh.tbl->tail = _hs_tail;                                         \
++        DECLTYPE_ASSIGN(head, ELMT_FROM_HH((head)->hh.tbl, _hs_list));           \
++      }                                                                          \
++      _hs_insize *= 2U;                                                          \
++    }                                                                            \
++    HASH_FSCK(hh, head, "HASH_SRT");                                             \
++  }                                                                              \
++} while (0)
++
++/* This function selects items from one hash into another hash.
++ * The end result is that the selected items have dual presence
++ * in both hashes. There is no copy of the items made; rather
++ * they are added into the new hash through a secondary hash
++ * hash handle that must be present in the structure. */
++#define HASH_SELECT(hh_dst, dst, hh_src, src, cond)                              \
++do {                                                                             \
++  unsigned _src_bkt, _dst_bkt;                                                   \
++  void *_last_elt = NULL, *_elt;                                                 \
++  UT_hash_handle *_src_hh, *_dst_hh, *_last_elt_hh=NULL;                         \
++  ptrdiff_t _dst_hho = ((char*)(&(dst)->hh_dst) - (char*)(dst));                 \
++  if ((src) != NULL) {                                                           \
++    for (_src_bkt=0; _src_bkt < (src)->hh_src.tbl->num_buckets; _src_bkt++) {    \
++      for (_src_hh = (src)->hh_src.tbl->buckets[_src_bkt].hh_head;               \
++        _src_hh != NULL;                                                         \
++        _src_hh = _src_hh->hh_next) {                                            \
++        _elt = ELMT_FROM_HH((src)->hh_src.tbl, _src_hh);                         \
++        if (cond(_elt)) {                                                        \
++          IF_HASH_NONFATAL_OOM( int _hs_oomed = 0; )                             \
++          _dst_hh = (UT_hash_handle*)(void*)(((char*)_elt) + _dst_hho);          \
++          _dst_hh->key = _src_hh->key;                                           \
++          _dst_hh->keylen = _src_hh->keylen;                                     \
++          _dst_hh->hashv = _src_hh->hashv;                                       \
++          _dst_hh->prev = _last_elt;                                             \
++          _dst_hh->next = NULL;                                                  \
++          if (_last_elt_hh != NULL) {                                            \
++            _last_elt_hh->next = _elt;                                           \
++          }                                                                      \
++          if ((dst) == NULL) {                                                   \
++            DECLTYPE_ASSIGN(dst, _elt);                                          \
++            HASH_MAKE_TABLE(hh_dst, dst, _hs_oomed);                             \
++            IF_HASH_NONFATAL_OOM(                                                \
++              if (_hs_oomed) {                                                   \
++                uthash_nonfatal_oom(_elt);                                       \
++                (dst) = NULL;                                                    \
++                continue;                                                        \
++              }                                                                  \
++            )                                                                    \
++          } else {                                                               \
++            _dst_hh->tbl = (dst)->hh_dst.tbl;                                    \
++          }                                                                      \
++          HASH_TO_BKT(_dst_hh->hashv, _dst_hh->tbl->num_buckets, _dst_bkt);      \
++          HASH_ADD_TO_BKT(_dst_hh->tbl->buckets[_dst_bkt], hh_dst, _dst_hh, _hs_oomed); \
++          (dst)->hh_dst.tbl->num_items++;                                        \
++          IF_HASH_NONFATAL_OOM(                                                  \
++            if (_hs_oomed) {                                                     \
++              HASH_ROLLBACK_BKT(hh_dst, dst, _dst_hh);                           \
++              HASH_DELETE_HH(hh_dst, dst, _dst_hh);                              \
++              _dst_hh->tbl = NULL;                                               \
++              uthash_nonfatal_oom(_elt);                                         \
++              continue;                                                          \
++            }                                                                    \
++          )                                                                      \
++          HASH_BLOOM_ADD(_dst_hh->tbl, _dst_hh->hashv);                          \
++          _last_elt = _elt;                                                      \
++          _last_elt_hh = _dst_hh;                                                \
++        }                                                                        \
++      }                                                                          \
++    }                                                                            \
++  }                                                                              \
++  HASH_FSCK(hh_dst, dst, "HASH_SELECT");                                         \
++} while (0)
++
++#define HASH_CLEAR(hh,head)                                                      \
++do {                                                                             \
++  if ((head) != NULL) {                                                          \
++    HASH_BLOOM_FREE((head)->hh.tbl);                                             \
++    uthash_free((head)->hh.tbl->buckets,                                         \
++                (head)->hh.tbl->num_buckets*sizeof(struct UT_hash_bucket));      \
++    uthash_free((head)->hh.tbl, sizeof(UT_hash_table));                          \
++    (head) = NULL;                                                               \
++  }                                                                              \
++} while (0)
++
++#define HASH_OVERHEAD(hh,head)                                                   \
++ (((head) != NULL) ? (                                                           \
++ (size_t)(((head)->hh.tbl->num_items   * sizeof(UT_hash_handle))   +             \
++          ((head)->hh.tbl->num_buckets * sizeof(UT_hash_bucket))   +             \
++           sizeof(UT_hash_table)                                   +             \
++           (HASH_BLOOM_BYTELEN))) : 0U)
++
++#ifdef NO_DECLTYPE
++#define HASH_ITER(hh,head,el,tmp)                                                \
++for(((el)=(head)), ((*(char**)(&(tmp)))=(char*)((head!=NULL)?(head)->hh.next:NULL)); \
++  (el) != NULL; ((el)=(tmp)), ((*(char**)(&(tmp)))=(char*)((tmp!=NULL)?(tmp)->hh.next:NULL)))
++#else
++#define HASH_ITER(hh,head,el,tmp)                                                \
++for(((el)=(head)), ((tmp)=DECLTYPE(el)((head!=NULL)?(head)->hh.next:NULL));      \
++  (el) != NULL; ((el)=(tmp)), ((tmp)=DECLTYPE(el)((tmp!=NULL)?(tmp)->hh.next:NULL)))
++#endif
++
++/* obtain a count of items in the hash */
++#define HASH_COUNT(head) HASH_CNT(hh,head)
++#define HASH_CNT(hh,head) ((head != NULL)?((head)->hh.tbl->num_items):0U)
++
++typedef struct UT_hash_bucket {
++   struct UT_hash_handle *hh_head;
++   unsigned count;
++
++   /* expand_mult is normally set to 0. In this situation, the max chain length
++    * threshold is enforced at its default value, HASH_BKT_CAPACITY_THRESH. (If
++    * the bucket's chain exceeds this length, bucket expansion is triggered).
++    * However, setting expand_mult to a non-zero value delays bucket expansion
++    * (that would be triggered by additions to this particular bucket)
++    * until its chain length reaches a *multiple* of HASH_BKT_CAPACITY_THRESH.
++    * (The multiplier is simply expand_mult+1). The whole idea of this
++    * multiplier is to reduce bucket expansions, since they are expensive, in
++    * situations where we know that a particular bucket tends to be overused.
++    * It is better to let its chain length grow to a longer yet-still-bounded
++    * value, than to do an O(n) bucket expansion too often.
++    */
++   unsigned expand_mult;
++
++} UT_hash_bucket;
++
++/* random signature used only to find hash tables in external analysis */
++#define HASH_SIGNATURE 0xa0111fe1u
++#define HASH_BLOOM_SIGNATURE 0xb12220f2u
++
++typedef struct UT_hash_table {
++   UT_hash_bucket *buckets;
++   unsigned num_buckets, log2_num_buckets;
++   unsigned num_items;
++   struct UT_hash_handle *tail; /* tail hh in app order, for fast append    */
++   ptrdiff_t hho; /* hash handle offset (byte pos of hash handle in element */
++
++   /* in an ideal situation (all buckets used equally), no bucket would have
++    * more than ceil(#items/#buckets) items. that's the ideal chain length. */
++   unsigned ideal_chain_maxlen;
++
++   /* nonideal_items is the number of items in the hash whose chain position
++    * exceeds the ideal chain maxlen. these items pay the penalty for an uneven
++    * hash distribution; reaching them in a chain traversal takes >ideal steps */
++   unsigned nonideal_items;
++
++   /* ineffective expands occur when a bucket doubling was performed, but
++    * afterward, more than half the items in the hash had nonideal chain
++    * positions. If this happens on two consecutive expansions we inhibit any
++    * further expansion, as it's not helping; this happens when the hash
++    * function isn't a good fit for the key domain. When expansion is inhibited
++    * the hash will still work, albeit no longer in constant time. */
++   unsigned ineff_expands, noexpand;
++
++   uint32_t signature; /* used only to find hash tables in external analysis */
++#ifdef HASH_BLOOM
++   uint32_t bloom_sig; /* used only to test bloom exists in external analysis */
++   uint8_t *bloom_bv;
++   uint8_t bloom_nbits;
++#endif
++
++} UT_hash_table;
++
++typedef struct UT_hash_handle {
++   struct UT_hash_table *tbl;
++   void *prev;                       /* prev element in app order      */
++   void *next;                       /* next element in app order      */
++   struct UT_hash_handle *hh_prev;   /* previous hh in bucket order    */
++   struct UT_hash_handle *hh_next;   /* next hh in bucket order        */
++   const void *key;                  /* ptr to enclosing struct's key  */
++   unsigned keylen;                  /* enclosing struct's key len     */
++   unsigned hashv;                   /* result of hash-fcn(key)        */
++} UT_hash_handle;
++
++#endif /* UTHASH_H */
+\ No newline at end of file
+diff --git a/hw/block/femu/nvme-admin.c b/hw/block/femu/nvme-admin.c
+index b50969236..cd9c65af7 100644
+--- a/hw/block/femu/nvme-admin.c
++++ b/hw/block/femu/nvme-admin.c
+@@ -72,6 +72,7 @@ static uint16_t nvme_del_sq(FemuCtrl *n, NvmeCmd *cmd)
+     NvmeSQueue *sq;
+     NvmeCQueue *cq;
+     uint16_t qid = le16_to_cpu(c->qid);
++    int rc;
+ 
+     if (!qid || nvme_check_sqid(n, qid)) {
+         return NVME_INVALID_QID | NVME_DNR;
+@@ -88,7 +89,11 @@ static uint16_t nvme_del_sq(FemuCtrl *n, NvmeCmd *cmd)
+         QTAILQ_FOREACH_SAFE(req, &cq->req_list, entry, next) {
+             if (req->sq == sq) {
+                 QTAILQ_REMOVE(&cq->req_list, req, entry);
+-                QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
++                rc = femu_ring_enqueue(sq->io_req_ring, (void *)&req, 1);
++                if (rc != 1) {
++                    femu_err("NVMe: %s enqueue sq->io_req_ring failed\n", __func__);
++                    abort();
++                }
+             }
+         }
+     }
+@@ -832,6 +837,9 @@ static uint16_t nvme_abort_req(FemuCtrl *n, NvmeCmd *cmd, uint32_t *result)
+     uint16_t cid = (cmd->cdw10 >> 16) & 0xffff;
+     NvmeSQueue *sq;
+     NvmeRequest *req;
++    int rc;
++
++    femu_err("Received abort command (Not fully supported yet)\n");
+ 
+     *result = 1;
+     if (nvme_check_sqid(n, sqid)) {
+@@ -854,9 +862,11 @@ static uint16_t nvme_abort_req(FemuCtrl *n, NvmeCmd *cmd, uint32_t *result)
+         nvme_addr_read(n, addr, (void *)&abort_cmd, sizeof(abort_cmd));
+         if (abort_cmd.cid == cid) {
+             *result = 0;
+-            req = QTAILQ_FIRST(&sq->req_list);
+-            QTAILQ_REMOVE(&sq->req_list, req, entry);
+-            QTAILQ_INSERT_TAIL(&sq->out_req_list, req, entry);
++            rc = femu_ring_dequeue(sq->io_req_ring, (void *)&req, 1);
++            if (rc != 1) {
++                femu_err("NVMe: %s dequeue sq->io_req_ring failed\n", __func__);
++                abort();
++            }
+ 
+             memset(&req->cqe, 0, sizeof(req->cqe));
+             req->cqe.cid = cid;
+diff --git a/hw/block/femu/nvme-io.c b/hw/block/femu/nvme-io.c
+index aa4fc699a..319f20676 100644
+--- a/hw/block/femu/nvme-io.c
++++ b/hw/block/femu/nvme-io.c
+@@ -1,7 +1,5 @@
+ #include "./nvme.h"
+ 
+-static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
+-
+ static void nvme_update_sq_eventidx(const NvmeSQueue *sq)
+ {
+     if (sq->eventidx_addr_hva) {
+@@ -36,33 +34,18 @@ static inline void nvme_copy_cmd(NvmeCmd *dst, NvmeCmd *src)
+ #endif
+ }
+ 
+-/*
+- * For now, only the I/Os which needs delay emulation will be handled by the
+- * FEMU thread
+- */
+-static bool should_emulate_delay(NvmeCmd *cmd)
+-{
+-    int opc = cmd->cid;
+-
+-    if (opc == NVME_CMD_READ || opc == NVME_CMD_WRITE ||
+-        opc == NVME_CMD_OC_ERASE || opc == NVME_CMD_OC_WRITE ||
+-        opc == NVME_CMD_OC_READ) {
+-        return true;
+-    }
+-
+-    return false;
+-}
+-
+-static void nvme_process_sq_io(void *opaque, int index_poller)
++static void nvme_process_sq(FemuCtrl *n, int index)
+ {
+-    NvmeSQueue *sq = opaque;
+-    FemuCtrl *n = sq->ctrl;
+-
+-    uint16_t status;
++    NvmeSQueue *sq = n->sq[index];
+     hwaddr addr;
+     NvmeCmd cmd;
+     NvmeRequest *req;
+     int processed = 0;
++    int rc;
++
++    if (NULL == sq) {
++        return;
++    }
+ 
+     nvme_update_sq_tail(sq);
+     while (!(nvme_sq_empty(sq))) {
+@@ -76,34 +59,28 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
+         }
+         nvme_inc_sq_head(sq);
+ 
+-        req = QTAILQ_FIRST(&sq->req_list);
+-        QTAILQ_REMOVE(&sq->req_list, req, entry);
++        rc = femu_ring_dequeue(sq->io_req_ring, (void *)&req, 1);
++        if (rc != 1) {
++            femu_err("NVMe: dequeue sq->io_req_ring failed\n");
++            abort();
++        }
+         memset(&req->cqe, 0, sizeof(req->cqe));
+-        /* Coperd: record req->stime at earliest convenience */
+-        req->expire_time = req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        req->arrival_time = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++        req->expire_time = UINT64_MAX;
+         req->cqe.cid = cmd.cid;
+         req->cmd_opcode = cmd.opcode;
++        req->io_type = USER_IO;
++        req->nlb = le16_to_cpu(((NvmeRwCmd *)&cmd)->nlb) + 1;
+         memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
+ 
+-        if (n->print_log) {
+-            femu_debug("%s,cid:%d\n", __func__, cmd.cid);
++        if (req->cmd.res2 == 0) {
++            qatomic_add(&n->pending_fg_nlbs, req->nlb);
+         }
+ 
+-        status = nvme_io_cmd(n, &cmd, req);
+-        if (should_emulate_delay(&cmd) && status == NVME_SUCCESS) {
+-            req->status = status;
+-
+-            int rc = femu_ring_enqueue(n->to_ftl[index_poller], (void *)&req, 1);
+-            if (rc != 1) {
+-                femu_err("enqueue failed, ret=%d\n", rc);
+-            }
+-        } else if (status == NVME_SUCCESS) {
+-            /* Normal I/Os that don't need delay emulation */
+-            req->status = status;
+-        } else {
+-            femu_err("Error IO processed!\n");
++        int rc = femu_ring_enqueue(n->ftl_ring[0], (void *)&req, 1);
++        if (rc != 1) {
++            femu_err("enqueue failed, ret=%d\n", rc);
+         }
+-
+         processed++;
+     }
+ 
+@@ -119,9 +96,6 @@ static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
+     uint8_t phase = cq->phase;
+     hwaddr addr;
+ 
+-    if (n->print_log) {
+-        femu_debug("%s,req,lba:%lu,lat:%lu\n", n->devname, req->slba, req->reqlat);
+-    }
+     cqe->status = cpu_to_le16((req->status << 1) | phase);
+     cqe->sq_id = cpu_to_le16(sq->sqid);
+     cqe->sq_head = cpu_to_le16(sq->head);
+@@ -137,52 +111,70 @@ static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req)
+     nvme_inc_cq_tail(cq);
+ }
+ 
+-static void nvme_process_cq_cpl(void *arg, int index_poller)
++static void nvme_process_cq(FemuCtrl *n, int index)
+ {
+-    FemuCtrl *n = (FemuCtrl *)arg;
+-    NvmeCQueue *cq = NULL;
+-    NvmeRequest *req = NULL;
+-    struct rte_ring *rp = n->to_ftl[index_poller];
+-    pqueue_t *pq = n->pq[index_poller];
++    NvmeCQueue *cq = n->cq[index];
++    NvmeRequest *req = NULL, *next = NULL;
++    struct rte_ring *rp = n->ftl_ring[index];
++    pqueue_t *pq = n->pq[index];
+     uint64_t now;
+     int processed = 0;
+-    int rc;
++    int req_count, rc;
++
++    if (NULL == cq) {
++        return;
++    }
+ 
+     if (BBSSD(n)) {
+-        rp = n->to_poller[index_poller];
++        rp = n->cq_ring[index];
++    }
++
++    QTAILQ_FOREACH_SAFE(req, &cq->req_list, entry, next) {
++        if (req->expire_time == UINT64_MAX) {
++            continue;
++        }
++        QTAILQ_REMOVE(&cq->req_list, req, entry);
++        pqueue_insert(pq, req);
+     }
+ 
+-    while (femu_ring_count(rp)) {
++    req_count = femu_ring_count(rp);
++    while (req_count--) {
+         req = NULL;
+         rc = femu_ring_dequeue(rp, (void *)&req, 1);
+         if (rc != 1) {
+-            femu_err("dequeue from to_poller request failed\n");
++            femu_err("dequeue from cq_ring request failed\n");
+         }
+         assert(req);
+ 
+-        pqueue_insert(pq, req);
++        if (req->expire_time == UINT64_MAX) {
++            QTAILQ_INSERT_TAIL(&cq->req_list, req, entry);
++        } else {
++            pqueue_insert(pq, req);
++        }
+     }
+ 
+     while ((req = pqueue_peek(pq))) {
+-        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+         if (now < req->expire_time) {
+             break;
+         }
+ 
+-        cq = n->cq[req->sq->sqid];
+         if (!cq->is_active)
+             continue;
++
+         nvme_post_cqe(cq, req);
+-        QTAILQ_INSERT_TAIL(&req->sq->req_list, req, entry);
++        rc = femu_ring_enqueue(req->sq->io_req_ring, (void *)&req, 1);
++        if (rc != 1) {
++            femu_err("NVMe: enqueue req->sq->io_req_ring failed\n");
++            abort();
++        }
+         pqueue_pop(pq);
+         processed++;
+-        n->nr_tt_ios++;
++        n->nr_tt_ios[index]++;
+         if (now - req->expire_time >= 20000) {
+-            n->nr_tt_late_ios++;
+-            if (n->print_log) {
+-                femu_debug("%s,diff,pq.count=%lu,%" PRId64 ", %lu/%lu\n",
+-                           n->devname, pqueue_size(pq), now - req->expire_time,
+-                           n->nr_tt_late_ios, n->nr_tt_ios);
++            n->nr_tt_late_ios[index]++;
++            if (n->max_late[index] < now - req->expire_time) {
++                n->max_late[index] = now - req->expire_time;
+             }
+         }
+         n->should_isr[req->sq->sqid] = true;
+@@ -191,61 +183,51 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
+     if (processed == 0)
+         return;
+ 
+-    switch (n->multipoller_enabled) {
+-    case 1:
+-        nvme_isr_notify_io(n->cq[index_poller]);
+-        break;
+-    default:
+-        for (int i = 1; i <= n->num_io_queues; i++) {
+-            if (n->should_isr[i]) {
+-                nvme_isr_notify_io(n->cq[i]);
+-                n->should_isr[i] = false;
+-            }
++    nvme_isr_notify_io(n->cq[index]);
++}
++
++static void *sq_thread(void *args)
++{
++    FemuCtrl *n = ((FemuThreadArgument *)args)->n;
++    int index = ((FemuThreadArgument *)args)->index;
++
++    while (!n->dataplane_started) {
++        usleep(1000);
++    }
++
++    while (1) {
++        if (!n->dataplane_started) {
++            break;
++        }
++
++        for (int ring_index = index; ring_index <= n->num_io_queues;
++             ring_index += n->num_threads) {
++            nvme_process_sq(n, ring_index);
+         }
+-        break;
+     }
++
++    return NULL;
+ }
+ 
+-static void *nvme_poller(void *arg)
++static void *cq_thread(void *args)
+ {
+-    FemuCtrl *n = ((NvmePollerThreadArgument *)arg)->n;
+-    int index = ((NvmePollerThreadArgument *)arg)->index;
+-
+-    switch (n->multipoller_enabled) {
+-    case 1:
+-        while (1) {
+-            if ((!n->dataplane_started)) {
+-                usleep(1000);
+-                continue;
+-            }
++    FemuCtrl *n = ((FemuThreadArgument *)args)->n;
++    int index = ((FemuThreadArgument *)args)->index;
+ 
+-            NvmeSQueue *sq = n->sq[index];
+-            NvmeCQueue *cq = n->cq[index];
+-            if (sq && sq->is_active && cq && cq->is_active) {
+-                nvme_process_sq_io(sq, index);
+-            }
+-            nvme_process_cq_cpl(n, index);
++    while (!n->dataplane_started) {
++        usleep(1000);
++    }
++
++    while (1) {
++        if (!n->dataplane_started) {
++            break;
+         }
+-        break;
+-    default:
+-        while (1) {
+-            if ((!n->dataplane_started)) {
+-                usleep(1000);
+-                continue;
+-            }
+ 
+-            for (int i = 1; i <= n->num_io_queues; i++) {
+-                NvmeSQueue *sq = n->sq[i];
+-                NvmeCQueue *cq = n->cq[i];
+-                if (sq && sq->is_active && cq && cq->is_active) {
+-                    nvme_process_sq_io(sq, index);
+-                }
+-            }
+-            nvme_process_cq_cpl(n, index);
++        for (int ring_index = index; ring_index <= n->num_io_queues;
++             ring_index += n->num_threads) {
++            nvme_process_cq(n, ring_index);
+         }
+-        break;
+     }
+-
+     return NULL;
+ }
+ 
+@@ -277,31 +259,35 @@ static void set_pos(void *a, size_t pos)
+ void nvme_create_poller(FemuCtrl *n)
+ {
+     n->should_isr = g_malloc0(sizeof(bool) * (n->num_io_queues + 1));
++    n->nr_tt_ios = g_malloc0(sizeof(int64_t) * (n->num_io_queues + 1));
++    n->nr_tt_late_ios = g_malloc0(sizeof(int64_t) * (n->num_io_queues + 1));
++    n->max_late = g_malloc0(sizeof(uint64_t) * (n->num_io_queues + 1));
+ 
+-    n->num_poller = n->multipoller_enabled ? n->num_io_queues : 1;
+     /* Coperd: we put NvmeRequest into these rings */
+-    n->to_ftl = malloc(sizeof(struct rte_ring *) * (n->num_poller + 1));
+-    for (int i = 1; i <= n->num_poller; i++) {
+-        n->to_ftl[i] = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
+-        if (!n->to_ftl[i]) {
+-            femu_err("failed to create ring (n->to_ftl) ...\n");
++    n->ftl_ring = malloc(sizeof(struct rte_ring *) * (n->num_io_queues + 1));
++    for (int i = 0; i <= n->num_io_queues; i++) {
++        n->ftl_ring[i] =
++            femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
++        if (!n->ftl_ring[i]) {
++            femu_err("failed to create ring (n->ftl_ring) ...\n");
+             abort();
+         }
+-        assert(rte_ring_empty(n->to_ftl[i]));
++        assert(rte_ring_empty(n->ftl_ring[i]));
+     }
+ 
+-    n->to_poller = malloc(sizeof(struct rte_ring *) * (n->num_poller + 1));
+-    for (int i = 1; i <= n->num_poller; i++) {
+-        n->to_poller[i] = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
+-        if (!n->to_poller[i]) {
+-            femu_err("failed to create ring (n->to_poller) ...\n");
++    n->cq_ring = malloc(sizeof(struct rte_ring *) * (n->num_io_queues + 1));
++    for (int i = 1; i <= n->num_io_queues; i++) {
++        n->cq_ring[i] =
++            femu_ring_create(FEMU_RING_TYPE_SP_SC, FEMU_MAX_INF_REQS);
++        if (!n->cq_ring[i]) {
++            femu_err("failed to create ring (n->cq_ring) ...\n");
+             abort();
+         }
+-        assert(rte_ring_empty(n->to_poller[i]));
++        assert(rte_ring_empty(n->cq_ring[i]));
+     }
+ 
+-    n->pq = malloc(sizeof(pqueue_t *) * (n->num_poller + 1));
+-    for (int i = 1; i <= n->num_poller; i++) {
++    n->pq = malloc(sizeof(pqueue_t *) * (n->num_io_queues + 1));
++    for (int i = 1; i <= n->num_io_queues; i++) {
+         n->pq[i] = pqueue_init(FEMU_MAX_INF_REQS, cmp_pri, get_pri, set_pri,
+                                get_pos, set_pos);
+         if (!n->pq[i]) {
+@@ -310,15 +296,17 @@ void nvme_create_poller(FemuCtrl *n)
+         }
+     }
+ 
+-    n->poller = malloc(sizeof(QemuThread) * (n->num_poller + 1));
+-    NvmePollerThreadArgument *args = malloc(sizeof(NvmePollerThreadArgument) *
+-                                            (n->num_poller + 1));
+-    for (int i = 1; i <= n->num_poller; i++) {
++    n->sq_thread = malloc(sizeof(QemuThread) * (n->num_threads + 1));
++    n->cq_thread = malloc(sizeof(QemuThread) * (n->num_threads + 1));
++    FemuThreadArgument *args =
++        malloc(sizeof(FemuThreadArgument) * (n->num_threads + 1));
++    for (int i = 1; i <= n->num_threads; i++) {
+         args[i].n = n;
+         args[i].index = i;
+-        qemu_thread_create(&n->poller[i], "nvme-poller", nvme_poller, &args[i],
+-                           QEMU_THREAD_JOINABLE);
+-        femu_debug("nvme-poller [%d] created ...\n", i - 1);
++        qemu_thread_create(&n->sq_thread[i], "FEMU-SQ-Thread", sq_thread,
++                           &args[i], QEMU_THREAD_JOINABLE);
++        qemu_thread_create(&n->cq_thread[i], "FEMU-CQ-Thread", cq_thread,
++                           &args[i], QEMU_THREAD_JOINABLE);
+     }
+ }
+ 
+@@ -496,7 +484,7 @@ static uint16_t nvme_write_uncor(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     return NVME_SUCCESS;
+ }
+ 
+-static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
++uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
+ {
+     NvmeNamespace *ns;
+     uint32_t nsid = le32_to_cpu(cmd->nsid);
+@@ -556,7 +544,7 @@ void nvme_post_cqes_io(void *opaque)
+             break;
+         }
+ 
+-        cur_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        cur_time = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+         if (cq->cqid != 0 && cur_time < req->expire_time) {
+             ntt = req->expire_time;
+             break;
+@@ -567,7 +555,7 @@ void nvme_post_cqes_io(void *opaque)
+     }
+ 
+     if (ntt == 0) {
+-        ntt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + CQ_POLLING_PERIOD_NS;
++        ntt = qemu_clock_get_ns(QEMU_CLOCK_HOST) + CQ_POLLING_PERIOD_NS;
+     }
+ 
+     /* Only interrupt guest when we "do" complete some I/Os */
+diff --git a/hw/block/femu/nvme-util.c b/hw/block/femu/nvme-util.c
+index e1821ef96..e335fd8ed 100644
+--- a/hw/block/femu/nvme-util.c
++++ b/hw/block/femu/nvme-util.c
+@@ -164,6 +164,7 @@ uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
+     AddressSpace *as = pci_get_address_space(&n->parent_obj);
+     dma_addr_t sqsz = (dma_addr_t)size;
+     NvmeCQueue *cq;
++    int rc;
+ 
+     sq->ctrl = n;
+     sq->sqid = sqid;
+@@ -182,11 +183,15 @@ uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
+     }
+ 
+     sq->io_req = g_malloc0(sq->size * sizeof(*sq->io_req));
+-    QTAILQ_INIT(&sq->req_list);
+-    QTAILQ_INIT(&sq->out_req_list);
++    sq->io_req_ring = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
+     for (int i = 0; i < sq->size; i++) {
+-        sq->io_req[i].sq = sq;
+-        QTAILQ_INSERT_TAIL(&(sq->req_list), &sq->io_req[i], entry);
++        NvmeRequest *req = sq->io_req + i;
++        req->sq = sq;
++        rc = femu_ring_enqueue(sq->io_req_ring, (void *)&req, 1);
++        if (rc != 1) {
++            femu_err("prealloc sq->io_req_ring failed\n");
++            abort();
++        }
+     }
+ 
+     switch (prio) {
+diff --git a/hw/block/femu/nvme.h b/hw/block/femu/nvme.h
+index c1357c1c8..b71b9be6e 100644
+--- a/hw/block/femu/nvme.h
++++ b/hw/block/femu/nvme.h
+@@ -5,6 +5,7 @@
+ #include "qemu/uuid.h"
+ #include "qemu/units.h"
+ #include "qemu/cutils.h"
++#include "qemu/thread.h"
+ #include "hw/pci/msix.h"
+ #include "hw/pci/msi.h"
+ #include "hw/virtio/vhost.h"
+@@ -14,6 +15,7 @@
+ #include "backend/dram.h"
+ #include "inc/rte_ring.h"
+ #include "inc/pqueue.h"
++#include "inc/uthash.h"
+ #include "nand/nand.h"
+ #include "timing-model/timing.h"
+ 
+@@ -30,6 +32,17 @@
+ #define NVME_ID_NS_LBAF_DS(ns, lba_index) (ns->id_ns.lbaf[lba_index].lbads)
+ #define NVME_ID_NS_LBAF_MS(ns, lba_index) (ns->id_ns.lbaf[lba_index].ms)
+ 
++#define LOGGING_RING_BUF_MAX    (1048576)
++#define DATA_VALID              (1)
++#define DATA_INVALID            (0)
++#define BG_DESC_LEN             (64)
++
++enum NVME_BG_FLAG {
++    FLAG_QoS_BW         = 0,
++    FLAG_QoS_DDL        = 1,
++    FLAG_DEREGISTER     = 2
++};
++
+ typedef struct NvmeBar {
+     uint64_t    cap;
+     uint32_t    vs;
+@@ -325,6 +338,7 @@ enum NvmeAdminCommands {
+     NVME_ADM_CMD_SECURITY_SEND  = 0x81,
+     NVME_ADM_CMD_SECURITY_RECV  = 0x82,
+     NVME_ADM_CMD_SET_DB_MEMORY  = 0x7c,
++    NVME_ADM_CMD_BG_DEADLINE    = 0xe1,
+     NVME_ADM_CMD_FEMU_DEBUG     = 0xee,
+     NVME_ADM_CMD_FEMU_FLIP      = 0xef,
+ };
+@@ -978,10 +992,15 @@ typedef struct NvmeRequest {
+     QEMUSGList              qsg;
+     QEMUIOVector            iov;
+     QTAILQ_ENTRY(NvmeRequest)entry;
++    int64_t                 arrival_time;
+     int64_t                 stime;
+-    int64_t                 reqlat;
+-    int64_t                 gcrt;
+     int64_t                 expire_time;
++    uint32_t                io_type;
++
++    uint16_t                todo_subreq;
++    uint16_t                *todo_subreq_per_lun;   // for read
++    uint64_t                write_lpn;              // for write
++    uint64_t                max_subreq_expire_time;
+ 
+     /* OC2.0: sector offset relative to slba where reads become invalid */
+     uint64_t predef;
+@@ -1014,8 +1033,7 @@ typedef struct NvmeSQueue {
+     uint64_t    completed;
+     uint64_t    *prp_list;
+     NvmeRequest *io_req;
+-    QTAILQ_HEAD(sq_req_list, NvmeRequest) req_list;
+-    QTAILQ_HEAD(out_req_list, NvmeRequest) out_req_list;
++    struct rte_ring *io_req_ring;   // multi-thread access, use rte_ring instead
+     QTAILQ_ENTRY(NvmeSQueue) entry;
+ 
+     uint64_t    db_addr;
+@@ -1167,6 +1185,59 @@ typedef struct FemuExtCtrlOps {
+     uint16_t (*get_log)(struct FemuCtrl *, NvmeCmd *);
+ } FemuExtCtrlOps;
+ 
++// 最大 5s
++#define MAX_DDL_NS ((uint64_t)5e9)
++// 1e9 * 4 / 1024 = 3906250
++#define PAGE_DIV_NS_FACTOR ((double)3906250)
++
++typedef struct BGInfo {
++    UT_hash_handle  hh;
++    uint32_t        id;
++    uint32_t        deadline;   // ms
++    char            desc[BG_DESC_LEN];
++
++    double          min_rw_bw;      // 最低带宽保证
++    double          max_rw_bw;      // 最高带宽限制 for 平滑
++    double          cur_rw_bw;      // 区间内当前带宽
++    double          avg_rw_bw;      // 区间内平均带宽
++    uint32_t        issued_pages;   // 已下发 page 数量
++    int64_t         start_time;     // 区间的开始时间
++    int64_t         end_time;       // 区间的结束时间
++
++    QTAILQ_ENTRY(BGInfo)        entry;  // for DDL BG
++
++    QTAILQ_HEAD(, NvmeRequest)  req_list;
++} BGInfo;
++
++struct BGManage {
++    // 全局表
++    BGInfo              *hash_table;
++    BGInfo              *last_picked;
++    pthread_rwlock_t    rwlock;
++
++    // 防止积压严重，以及消耗内存过多
++    uint32_t    bg_pending_pages;   // 所有等待下发的 BG IO 的 pages 数量
++    uint32_t    max_pending_pages;  // 支持的最大等待下发的 BG IO 的 pages 数量
++
++    // 带宽控制
++    double      smooth_factor;  // 平滑系数 = max / min
++    uint64_t    bw_diff_time;   // 区间时间长度
++
++    // DDL 控制
++    QTAILQ_HEAD(, BGInfo) ddl_bg_list;  // DDL BG 列表头
++
++    int64_t     cur_max_ddl;        // 最大的 DDL 时间戳
++    uint64_t    ddl_diff_time;      // 区间时间长度
++    uint32_t    max_index;          // 区间数量
++    uint32_t    ddl_pending_pages;  // 所有等待下发的 DDL IO 的 pages 数量
++    uint32_t    *pending_pages;     // 每个区间的等待下发的 DDL IO 的 pages 数量
++    uint32_t    *issued_pages;      // 每个区间的已经下发的 DDL IO 的 pages 数量
++    uint32_t    last_index;         // 上次处理的区间索引
++    uint32_t    cur_index;          // 当前应该处理的区间索引
++    double      g_min_rw_bw;        // 最低带宽保证
++    double      ddl_min_rw_bg;      // 区间内最低带宽保证
++};
++
+ typedef struct FemuCtrl {
+     PCIDevice       parent_obj;
+     MemoryRegion    iomem;
+@@ -1217,6 +1288,7 @@ typedef struct FemuCtrl {
+     uint32_t    reg_size;
+     uint32_t    num_namespaces;
+     uint32_t    num_io_queues;
++    uint32_t    num_threads;
+     uint32_t    max_q_ents;
+     uint64_t    ns_size;
+     uint8_t     db_stride;
+@@ -1255,7 +1327,10 @@ typedef struct FemuCtrl {
+     uint32_t    cmbloc;
+     uint8_t     *cmbuf;
+ 
+-    QemuThread  *poller;
++    int64_t     pending_fg_nlbs;
++
++    QemuThread  *sq_thread;
++    QemuThread  *cq_thread;
+     bool        dataplane_started;
+     bool        vector_poll_started;
+ 
+@@ -1309,27 +1384,38 @@ typedef struct FemuCtrl {
+     int             completed;
+ 
+     char            devname[64];
+-    struct rte_ring **to_ftl;
+-    struct rte_ring **to_poller;
++    struct rte_ring **ftl_ring;
++    struct rte_ring **cq_ring;
+     pqueue_t        **pq;
+     bool            *should_isr;
+     bool            poller_on;
+ 
+-    int64_t         nr_tt_ios;
+-    int64_t         nr_tt_late_ios;
+-    bool            print_log;
++    struct BGManage bg_manage;
+ 
+-    uint8_t         multipoller_enabled;
+-    uint32_t        num_poller;
++    int64_t         *nr_tt_ios;
++    int64_t         *nr_tt_late_ios;
++    uint64_t        *max_late;
++    bool            logging;
++    QemuThread      nand_logging_thread;
+ 
+     /* Nand Flash Type: SLC/MLC/TLC/QLC/PLC */
+     uint8_t         flash_type;
+ } FemuCtrl;
+ 
+-typedef struct NvmePollerThreadArgument {
++typedef struct FemuThreadArgument {
+     FemuCtrl        *n;
+     int             index;
+-} NvmePollerThreadArgument;
++} FemuThreadArgument;
++
++typedef struct LogThreadArgument {
++    FemuCtrl    *n;
++    uint32_t    data_len;
++    uint64_t    **ring_buffer;
++    uint32_t    *head;
++    uint32_t    *tail;
++    const char  *table_header;
++    const char  *file;
++} LogThreadArgument;
+ 
+ typedef struct NvmeDifTuple {
+     uint16_t guard_tag;
+@@ -1341,6 +1427,17 @@ typedef struct NvmeDifTuple {
+ #define CQ_POLLING_PERIOD_NS	(5000)
+ #define FEMU_MAX_INF_REQS       (65536)
+ 
++enum {
++    USER_IO = 0,
++    GC_IO = 1,
++
++    FG_IO = 2,
++    BG_IO = 3,
++
++    QOS_BG_IO = 4,
++    FREE_BG_IO = 5,
++};
++
+ enum {
+     FEMU_OCSSD_MODE = 0,
+     FEMU_BBSSD_MODE = 1,
+@@ -1434,6 +1531,7 @@ void nvme_create_poller(FemuCtrl *n);
+ 
+ /* NVMe I/O */
+ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
++uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
+ 
+ int nvme_register_ocssd12(FemuCtrl *n);
+ int nvme_register_ocssd20(FemuCtrl *n);
+@@ -1492,6 +1590,16 @@ inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
+ #define femu_log(fmt, ...) \
+     do { printf("[FEMU] Log: " fmt, ## __VA_ARGS__); } while (0)
+ 
+-
++#define FLUSH_ID            (2)
++#define COMPACTION_ID       (3)
++#define FIO_ID              (4)
++
++/* BG Mangment */
++void bg_manage_init(FemuCtrl *n);
++BGInfo *find_bg(FemuCtrl *n, uint32_t id);
++BGInfo *add_bg(FemuCtrl *n, char *desc, uint32_t id, uint32_t deadline,
++                      uint32_t min_rw_bw);
++void del_bg(FemuCtrl *n, BGInfo *bg);
++void print_bgs(FemuCtrl *n);
+ #endif /* __FEMU_NVME_H */
+ 
+diff --git a/hw/block/meson.build b/hw/block/meson.build
+index 2331615d7..14eaeb30e 100644
+--- a/hw/block/meson.build
++++ b/hw/block/meson.build
+@@ -14,7 +14,7 @@ softmmu_ss.add(when: 'CONFIG_SWIM', if_true: files('swim.c'))
+ softmmu_ss.add(when: 'CONFIG_XEN', if_true: files('xen-block.c'))
+ softmmu_ss.add(when: 'CONFIG_SH4', if_true: files('tc58128.c'))
+ softmmu_ss.add(when: 'CONFIG_NVME_PCI', if_true: files('nvme.c', 'nvme-ns.c'))
+-softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files('femu/dma.c', 'femu/intr.c', 'femu/nvme-util.c', 'femu/nvme-admin.c', 'femu/nvme-io.c', 'femu/femu.c', 'femu/nossd/nop.c', 'femu/nand/nand.c', 'femu/timing-model/timing.c', 'femu/ocssd/oc12.c', 'femu/ocssd/oc20.c', 'femu/zns/zns.c', 'femu/bbssd/bb.c', 'femu/bbssd/ftl.c', 'femu/lib/pqueue.c', 'femu/lib/rte_ring.c', 'femu/backend/dram.c'))
++softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files('femu/dma.c', 'femu/intr.c', 'femu/nvme-util.c', 'femu/nvme-admin.c', 'femu/nvme-io.c', 'femu/femu.c', 'femu/nossd/nop.c', 'femu/nand/nand.c', 'femu/timing-model/timing.c', 'femu/ocssd/oc12.c', 'femu/ocssd/oc20.c', 'femu/zns/zns.c', 'femu/bbssd/bg_manage.c', 'femu/bbssd/bb.c', 'femu/bbssd/ftl.c', 'femu/lib/pqueue.c', 'femu/lib/rte_ring.c', 'femu/backend/dram.c'))
+ 
+ specific_ss.add(when: 'CONFIG_VIRTIO_BLK', if_true: files('virtio-blk.c'))
+ specific_ss.add(when: 'CONFIG_VHOST_USER_BLK', if_true: files('vhost-user-blk.c'))
