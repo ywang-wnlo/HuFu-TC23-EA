@@ -1,0 +1,789 @@
+diff --git a/Kernel/base/arch/x86/entry/syscalls/syscall_32.tbl b/Kernel/base/arch/x86/entry/syscalls/syscall_32.tbl
+index 15908eb9b..cbee896ec 100644
+--- a/Kernel/base/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/Kernel/base/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -440,3 +440,4 @@
+ 433	i386	fspick			sys_fspick			__ia32_sys_fspick
+ 434	i386	pidfd_open		sys_pidfd_open			__ia32_sys_pidfd_open
+ 435	i386	clone3			sys_clone3			__ia32_sys_clone3
++436	i386	nvme_bg_setup		sys_nvme_bg_setup		__ia32_sys_nvme_bg_setup
+diff --git a/Kernel/base/arch/x86/entry/syscalls/syscall_64.tbl b/Kernel/base/arch/x86/entry/syscalls/syscall_64.tbl
+index c29976eca..769aafe7c 100644
+--- a/Kernel/base/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/Kernel/base/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -357,6 +357,7 @@
+ 433	common	fspick			__x64_sys_fspick
+ 434	common	pidfd_open		__x64_sys_pidfd_open
+ 435	common	clone3			__x64_sys_clone3/ptregs
++436	common	nvme_bg_setup		__x64_sys_nvme_bg_setup
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/Kernel/base/block/bio.c b/Kernel/base/block/bio.c
+index cb38d6f3a..9912c194a 100644
+--- a/Kernel/base/block/bio.c
++++ b/Kernel/base/block/bio.c
+@@ -838,6 +838,11 @@ void __bio_add_page(struct bio *bio, struct page *page,
+ 	WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED));
+ 	WARN_ON_ONCE(bio_full(bio, len));
+ 
++#ifdef CONFIG_NVME_BG
++	bio->bg_id = current->bg_id;
++	bio->bg_deadline = current->bg_deadline;
++#endif /* CONFIG_NVME_BG */
++
+ 	bv->bv_page = page;
+ 	bv->bv_offset = off;
+ 	bv->bv_len = len;
+diff --git a/Kernel/base/block/blk-core.c b/Kernel/base/block/blk-core.c
+index 5808baa95..1dc477cd4 100644
+--- a/Kernel/base/block/blk-core.c
++++ b/Kernel/base/block/blk-core.c
+@@ -615,6 +615,13 @@ bool bio_attempt_back_merge(struct request *req, struct bio *bio,
+ 	req->biotail = bio;
+ 	req->__data_len += bio->bi_iter.bi_size;
+ 
++#ifdef CONFIG_NVME_BG
++	if (bio->bg_deadline < req->bg_deadline) {
++		req->bg_id = bio->bg_id;
++		req->bg_deadline = bio->bg_deadline;
++	}
++#endif /* CONFIG_NVME_BG */
++
+ 	blk_account_io_start(req, false);
+ 	return true;
+ }
+@@ -639,6 +646,13 @@ bool bio_attempt_front_merge(struct request *req, struct bio *bio,
+ 	req->__sector = bio->bi_iter.bi_sector;
+ 	req->__data_len += bio->bi_iter.bi_size;
+ 
++#ifdef CONFIG_NVME_BG
++	if (bio->bg_deadline < req->bg_deadline) {
++		req->bg_id = bio->bg_id;
++		req->bg_deadline = bio->bg_deadline;
++	}
++#endif /* CONFIG_NVME_BG */
++
+ 	blk_account_io_start(req, false);
+ 	return true;
+ }
+@@ -661,6 +675,13 @@ bool bio_attempt_discard_merge(struct request_queue *q, struct request *req,
+ 	req->__data_len += bio->bi_iter.bi_size;
+ 	req->nr_phys_segments = segments + 1;
+ 
++#ifdef CONFIG_NVME_BG
++	if (bio->bg_deadline < req->bg_deadline) {
++		req->bg_id = bio->bg_id;
++		req->bg_deadline = bio->bg_deadline;
++	}
++#endif /* CONFIG_NVME_BG */
++
+ 	blk_account_io_start(req, false);
+ 	return true;
+ no_merge:
+@@ -1190,6 +1211,9 @@ blk_qc_t submit_bio(struct bio *bio)
+ 	if (workingset_read)
+ 		psi_memstall_enter(&pflags);
+ 
++	bio->bg_id = current->bg_id;
++	bio->bg_deadline = current->bg_deadline;
++
+ 	ret = generic_make_request(bio);
+ 
+ 	if (workingset_read)
+diff --git a/Kernel/base/block/blk-flush.c b/Kernel/base/block/blk-flush.c
+index 5aa6fada2..8272b7a83 100644
+--- a/Kernel/base/block/blk-flush.c
++++ b/Kernel/base/block/blk-flush.c
+@@ -456,6 +456,11 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+ 	bio = bio_alloc(gfp_mask, 0);
+ 	bio_set_dev(bio, bdev);
+ 	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
++#ifdef CONFIG_NVME_BG
++	// 无 page 的空 bio 用于 flush，单独标记
++	bio->bg_id = current->bg_id;
++	bio->bg_deadline = current->bg_deadline;
++#endif /* CONFIG_NVME_BG */
+ 
+ 	ret = submit_bio_wait(bio);
+ 
+diff --git a/Kernel/base/block/blk-lib.c b/Kernel/base/block/blk-lib.c
+index 5f2c429d4..8e3b2c589 100644
+--- a/Kernel/base/block/blk-lib.c
++++ b/Kernel/base/block/blk-lib.c
+@@ -69,6 +69,11 @@ int __blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+ 		sector += req_sects;
+ 		nr_sects -= req_sects;
+ 
++#ifdef CONFIG_NVME_BG
++		// discard 命令，单独标记
++		bio->bg_id = current->bg_id;
++		bio->bg_deadline = current->bg_deadline;
++#endif /* CONFIG_NVME_BG */
+ 		/*
+ 		 * We can loop for a long time in here, if someone does
+ 		 * full device discards (like mkfs). Be nice and allow
+diff --git a/Kernel/base/block/blk-merge.c b/Kernel/base/block/blk-merge.c
+index 03959bfe9..be1516eff 100644
+--- a/Kernel/base/block/blk-merge.c
++++ b/Kernel/base/block/blk-merge.c
+@@ -320,6 +320,10 @@ void __blk_queue_split(struct request_queue *q, struct bio **bio,
+ 	if (split) {
+ 		/* there isn't chance to merge the splitted bio */
+ 		split->bi_opf |= REQ_NOMERGE;
++#ifdef CONFIG_NVME_BG
++		split->bg_id = (*bio)->bg_id;
++		split->bg_deadline = (*bio)->bg_deadline;
++#endif /* CONFIG_NVME_BG */
+ 
+ 		/*
+ 		 * Since we're recursing into make_request here, ensure
+diff --git a/Kernel/base/block/blk-mq.c b/Kernel/base/block/blk-mq.c
+index 0674f53c6..4cad1feac 100644
+--- a/Kernel/base/block/blk-mq.c
++++ b/Kernel/base/block/blk-mq.c
+@@ -311,6 +311,10 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
+ 		data->hctx->tags->rqs[rq->tag] = rq;
+ 	}
+ 
++#ifdef CONFIG_NVME_BG
++	rq->bg_id = 0;
++#endif /* CONFIG_NVME_BG */
++
+ 	/* csd/requeue_work/fifo_time is initialized before use */
+ 	rq->q = data->q;
+ 	rq->mq_ctx = data->ctx;
+@@ -1811,6 +1815,11 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio,
+ 	blk_rq_bio_prep(rq, bio, nr_segs);
+ 
+ 	blk_account_io_start(rq, true);
++
++#ifdef CONFIG_NVME_BG
++	rq->bg_id = bio->bg_id;
++	rq->bg_deadline = bio->bg_deadline;
++#endif /* CONFIG_NVME_BG */
+ }
+ 
+ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
+diff --git a/Kernel/base/drivers/nvdimm/nd.h b/Kernel/base/drivers/nvdimm/nd.h
+index ee5c04070..c705bd563 100644
+--- a/Kernel/base/drivers/nvdimm/nd.h
++++ b/Kernel/base/drivers/nvdimm/nd.h
+@@ -373,7 +373,7 @@ void nvdimm_badblocks_populate(struct nd_region *nd_region,
+ #if IS_ENABLED(CONFIG_ND_CLAIM)
+ 
+ /* max struct page size independent of kernel config */
+-#define MAX_STRUCT_PAGE_SIZE 64
++#define MAX_STRUCT_PAGE_SIZE 80
+ 
+ int nvdimm_setup_pfn(struct nd_pfn *nd_pfn, struct dev_pagemap *pgmap);
+ int devm_nsio_enable(struct device *dev, struct nd_namespace_io *nsio);
+diff --git a/Kernel/base/drivers/nvme/host/Kconfig b/Kernel/base/drivers/nvme/host/Kconfig
+index 7b3f6555e..d66f8cef6 100644
+--- a/Kernel/base/drivers/nvme/host/Kconfig
++++ b/Kernel/base/drivers/nvme/host/Kconfig
+@@ -75,3 +75,14 @@ config NVME_TCP
+ 	  from https://github.com/linux-nvme/nvme-cli.
+ 
+ 	  If unsure, say N.
++
++config NVME_BG
++	bool "NVMe Background IO Support"
++	depends on NVME_CORE
++	depends on BLK_DEV_NVME
++	default y
++
++config NVME_BG_LOG
++	bool "BG Log Support"
++	depends on NVME_BG
++	default y
+diff --git a/Kernel/base/drivers/nvme/host/Makefile b/Kernel/base/drivers/nvme/host/Makefile
+index 8a4b671c5..3d08b8c64 100644
+--- a/Kernel/base/drivers/nvme/host/Makefile
++++ b/Kernel/base/drivers/nvme/host/Makefile
+@@ -14,6 +14,7 @@ nvme-core-$(CONFIG_TRACING)		+= trace.o
+ nvme-core-$(CONFIG_NVME_MULTIPATH)	+= multipath.o
+ nvme-core-$(CONFIG_NVM)			+= lightnvm.o
+ nvme-core-$(CONFIG_FAULT_INJECTION_DEBUG_FS)	+= fault_inject.o
++nvme-core-$(CONFIG_NVME_BG)		+= bg.o
+ 
+ nvme-y					+= pci.o
+ 
+diff --git a/Kernel/base/drivers/nvme/host/bg.c b/Kernel/base/drivers/nvme/host/bg.c
+new file mode 100644
+index 000000000..96fe0a0bd
+--- /dev/null
++++ b/Kernel/base/drivers/nvme/host/bg.c
+@@ -0,0 +1,215 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * bg.c -- nvme_bg
++ *
++ * Copyright 2021, Yu Wang
++ */
++
++#include <linux/syscalls.h>
++
++#include "nvme.h"
++#include "bg.h"
++
++static atomic_t g_bg_id;
++
++static struct bg_nvme_ctrl_s g_nvme_ctrl, *nvme_ctrl = &g_nvme_ctrl;
++
++#ifdef CONFIG_NVME_BG_LOG
++
++#include "../../../kernel/workqueue_internal.h"
++
++#define COMMAND_LINE_SIZE	(4096)
++
++static inline void format_cmdline(char *cmdline, int len)
++{
++	int index = 0, last_0 = 0;
++	while (index++ < len) {
++		if (cmdline[index] == '\0') {
++			last_0 = index;
++		} else if (last_0) {
++			cmdline[last_0] = ' ';
++			last_0 = 0;
++		}
++	}
++}
++
++static inline void bg_log(void)
++{
++	struct task_struct *task = current;
++	work_func_t *fn = NULL;
++	struct worker *worker = NULL;
++	char cmdline[COMMAND_LINE_SIZE];
++	int len = 0;
++
++	if (task->flags & PF_WQ_WORKER) {
++		worker = kthread_probe_data(task);
++		probe_kernel_read(&fn, &worker->current_func, sizeof(fn));
++
++		printk("[BG_LOG] [worker] bg_id:%u,pid:%u,tgid:%u,command:%s,work_func:%ps\n",
++		       task->bg_id, task->pid, task->tgid, task->comm, fn);
++	} else if (task->flags & PF_KTHREAD) {
++		printk("[BG_LOG] [kthread] bg_id:%u,pid:%u,tgid:%u,command:%s\n",
++		       task->bg_id, task->pid, task->tgid, task->comm);
++	} else {
++		len = get_cmdline(task, cmdline, COMMAND_LINE_SIZE);
++		format_cmdline(cmdline, len);
++
++		printk("[BG_LOG] [normal] bg_id:%u,pid:%u,tgid:%u,command:%s,cmdline:%s\n",
++		       task->bg_id, task->pid, task->tgid, task->comm, cmdline);
++	}
++}
++#endif /* CONFIG_NVME_BG_LOG */
++
++void bg_add_ctrl(struct nvme_ctrl *ctrl)
++{
++	spin_lock(&nvme_ctrl->lock);
++	list_add(&ctrl->bg_list, &nvme_ctrl->list);
++	spin_unlock(&nvme_ctrl->lock);
++}
++
++static void nvme_issue_bg_deadline(unsigned int flags, unsigned int qos)
++{
++	struct nvme_command c = { };
++	struct list_head *pos;
++	struct nvme_ctrl *ctrl;
++
++	c.common.opcode = nvme_admin_bg_deadline;
++	if (current->bg_desc) {
++		c.common.dptr.prp1 = cpu_to_le64(__pa(current->bg_desc));
++	} else {
++		c.common.dptr.prp1 = cpu_to_le64(__pa(current->comm));
++	}
++	c.common.cdw10 = cpu_to_le32(current->bg_id);
++	c.common.cdw11 = cpu_to_le32(flags);
++	c.common.cdw12= cpu_to_le32(qos);
++
++	list_for_each(pos, &nvme_ctrl->list)  {
++		ctrl = list_entry(pos, struct nvme_ctrl, bg_list);
++		nvme_submit_sync_cmd(ctrl->admin_q, &c, NULL, 0);
++	}
++}
++
++static long nvme_bg_register(unsigned int flags, unsigned int qos,
++			     char __user *desc, unsigned int __user *bg_id)
++{
++	if (!qos) {
++		return -EINVAL;
++	}
++
++	if (desc && !current->bg_desc) {
++		current->bg_desc = kmalloc(BG_DESC_LEN, GFP_KERNEL);
++		if (copy_from_user(current->bg_desc, desc, BG_DESC_LEN))
++			return -EFAULT;
++	}
++
++	current->bg_id = atomic_add_return(1, &g_bg_id);
++	if (copy_to_user(bg_id, &current->bg_id, sizeof(unsigned int))) {
++		current->bg_id = 0;
++		return -EFAULT;
++	}
++
++	if (flags & FLAG_QoS_DDL) {
++		current->bg_deadline = qos;
++	} else {
++		current->bg_deadline = DEF_DEADLINE;
++	}
++	nvme_issue_bg_deadline(flags, qos);
++#ifdef CONFIG_NVME_BG_LOG
++	bg_log();
++#endif /* CONFIG_NVME_BG_LOG */
++
++	return 0;
++}
++
++static long nvme_bg_change_qos(unsigned int flags, unsigned int qos)
++{
++	if (!current->bg_id) {
++		return -EPERM;
++	}
++
++	if (!qos) {
++		return -EINVAL;
++	}
++
++	if (flags & FLAG_QoS_DDL) {
++		current->bg_deadline = qos;
++	} else {
++		current->bg_deadline = DEF_DEADLINE;
++	}
++	nvme_issue_bg_deadline(flags, qos);
++
++	return 0;
++}
++
++static long nvme_bg_deregister(void)
++{
++	if (!current->bg_id) {
++		return -EPERM;
++	}
++
++	current->bg_deadline = 0;
++	// current->desc 在进程退出时会清除
++	nvme_issue_bg_deadline(FLAG_DEREGISTER, 0);
++	current->bg_id = 0;
++
++	return 0;
++}
++
++// 直接利用 unsigned int 传递 bg_id
++static long nvme_bg_set_id(unsigned int bg_id)
++{
++	current->bg_id = bg_id;
++	current->bg_deadline = DEF_DEADLINE;
++#ifdef CONFIG_NVME_BG_LOG
++	if (current->bg_id) {
++		bg_log();
++	}
++#endif /* CONFIG_NVME_BG_LOG */
++
++	return 0;
++}
++
++static long nvme_bg_setup(unsigned int opcode_flags, unsigned int arg1,
++			  char __user *arg2, unsigned int __user *arg3)
++{
++	long ret = 0;
++
++	switch (opcode_flags & OPCODE_MASK) {
++	case OP_REGISTER:
++		ret = nvme_bg_register(opcode_flags >> FLAGS_SHIFT, arg1, arg2, arg3);
++		break;
++	case OP_DEREGISTER:
++		ret = nvme_bg_deregister();
++		break;
++	case OP_CHANGE_QOS:
++		ret = nvme_bg_change_qos(opcode_flags >> FLAGS_SHIFT, arg1);
++		break;
++	case OP_SET_ID:
++		ret = nvme_bg_set_id(arg1);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++SYSCALL_DEFINE4(nvme_bg_setup, unsigned int, opcode, unsigned int, arg1,
++		char __user *, arg2, unsigned int __user *, arg3)
++{
++	return nvme_bg_setup(opcode, arg1, arg2, arg3);
++}
++
++void __init nvme_bg_init(void)
++{
++	// 预留 10 个 id，分别用于
++	// 1 -- page cache 的 write back
++	// 2 -- rocksDB 的 flush
++	// 3 -- rocksDB 的 compaction
++	// 4 -- fio
++	// etc
++	atomic_set(&g_bg_id, 10);
++
++	INIT_LIST_HEAD(&nvme_ctrl->list);
++	spin_lock_init(&nvme_ctrl->lock);
++}
+diff --git a/Kernel/base/drivers/nvme/host/bg.h b/Kernel/base/drivers/nvme/host/bg.h
+new file mode 100644
+index 000000000..24b3de2b7
+--- /dev/null
++++ b/Kernel/base/drivers/nvme/host/bg.h
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * bg_prio.h -- handles /proc/bg_prio
++ *
++ * Copyright 2021, Yu Wang
++ */
++
++#ifndef _BG_PRIO_H_
++#define _BG_PRIO_H_
++
++#include <linux/init.h>
++
++#define BG_DESC_LEN		(64)
++#define WRITEBACK_ID		(1)
++#define DEF_DEADLINE		(30e3)
++#define FLAGS_SHIFT		(16)
++#define OPCODE_MASK		(0xff)
++
++enum NVME_BG_OP {
++	OP_REGISTER		= 0,
++	OP_DEREGISTER		= 1,
++	OP_CHANGE_QOS		= 2,
++	OP_SET_ID		= 3
++};
++
++enum NVME_BG_FLAG {
++	FLAG_QoS_BW		= 0,
++	FLAG_QoS_DDL		= 1,
++	FLAG_DEREGISTER		= 2
++};
++
++struct bg_nvme_ctrl_s {
++	struct list_head	list;
++	spinlock_t		lock;
++};
++
++void bg_add_ctrl(struct nvme_ctrl *ctrl);
++
++void __init nvme_bg_init(void);
++
++#endif /* _BG_PRIO_H_ */
+diff --git a/Kernel/base/drivers/nvme/host/core.c b/Kernel/base/drivers/nvme/host/core.c
+index 6041511b8..31e235a94 100644
+--- a/Kernel/base/drivers/nvme/host/core.c
++++ b/Kernel/base/drivers/nvme/host/core.c
+@@ -31,6 +31,10 @@
+ 
+ #define NVME_MINORS		(1U << MINORBITS)
+ 
++#ifdef CONFIG_NVME_BG
++#include "bg.h"
++#endif /* CONFIG_NVME_BG */
++
+ unsigned int admin_timeout = 60;
+ module_param(admin_timeout, uint, 0644);
+ MODULE_PARM_DESC(admin_timeout, "timeout in seconds for admin commands");
+@@ -671,6 +675,9 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ 
+ 	cmnd->dsm.opcode = nvme_cmd_dsm;
+ 	cmnd->dsm.nsid = cpu_to_le32(ns->head->ns_id);
++#ifdef CONFIG_NVME_BG
++	cmnd->dsm.rsvd2[0] = cpu_to_le64(req->bg_id);
++#endif /* CONFIG_NVME_BG */
+ 	cmnd->dsm.nr = cpu_to_le32(segments - 1);
+ 	cmnd->dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
+ 
+@@ -718,6 +725,10 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
+ 	cmnd->rw.slba = cpu_to_le64(nvme_sect_to_lba(ns, blk_rq_pos(req)));
+ 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
+ 
++#ifdef CONFIG_NVME_BG
++	cmnd->rw.rsvd2 = cpu_to_le64(req->bg_id);
++#endif /* CONFIG_NVME_BG */
++
+ 	if (req_op(req) == REQ_OP_WRITE && ctrl->nr_streams)
+ 		nvme_assign_write_stream(ctrl, req, &control, &dsmgmt);
+ 
+@@ -4056,6 +4067,10 @@ static void nvme_free_ctrl(struct device *dev)
+ 		container_of(dev, struct nvme_ctrl, ctrl_device);
+ 	struct nvme_subsystem *subsys = ctrl->subsys;
+ 
++#ifdef CONFIG_NVME_BG
++	list_del_rcu(&ctrl->bg_list);
++#endif /* CONFIG_NVME_BG */
++
+ 	if (!subsys || ctrl->instance != subsys->instance)
+ 		ida_simple_remove(&nvme_instance_ida, ctrl->instance);
+ 
+@@ -4146,6 +4161,10 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+ 
+ 	nvme_fault_inject_init(&ctrl->fault_inject, dev_name(ctrl->device));
+ 
++#ifdef CONFIG_NVME_BG
++	bg_add_ctrl(ctrl);
++#endif /* CONFIG_NVME_BG */
++
+ 	return 0;
+ out_free_name:
+ 	nvme_put_ctrl(ctrl);
+@@ -4334,6 +4353,11 @@ static int __init nvme_core_init(void)
+ 		result = PTR_ERR(nvme_subsys_class);
+ 		goto destroy_class;
+ 	}
++
++#ifdef CONFIG_NVME_BG
++	nvme_bg_init();
++#endif /* CONFIG_NVME_BG */
++
+ 	return 0;
+ 
+ destroy_class:
+diff --git a/Kernel/base/drivers/nvme/host/nvme.h b/Kernel/base/drivers/nvme/host/nvme.h
+index 62e540186..7f87f8828 100644
+--- a/Kernel/base/drivers/nvme/host/nvme.h
++++ b/Kernel/base/drivers/nvme/host/nvme.h
+@@ -290,6 +290,10 @@ struct nvme_ctrl {
+ 	unsigned long discard_page_busy;
+ 
+ 	struct nvme_fault_inject fault_inject;
++
++#ifdef CONFIG_NVME_BG
++	struct list_head bg_list;
++#endif /* CONFIG_NVME_BG */
+ };
+ 
+ enum nvme_iopolicy {
+diff --git a/Kernel/base/drivers/nvme/host/pci.c b/Kernel/base/drivers/nvme/host/pci.c
+index 2cb2ead76..30d5e2a11 100644
+--- a/Kernel/base/drivers/nvme/host/pci.c
++++ b/Kernel/base/drivers/nvme/host/pci.c
+@@ -1277,6 +1277,12 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 	struct nvme_command cmd;
+ 	u32 csts = readl(dev->bar + NVME_REG_CSTS);
+ 
++#ifdef CONFIG_NVME_BG
++	if (req->bg_id) {
++		return BLK_EH_RESET_TIMER;
++	}
++#endif /* CONFIG_NVME_BG */
++
+ 	/* If PCI error recovery process is happening, we cannot reset or
+ 	 * the recovery mechanism will surely fail.
+ 	 */
+diff --git a/Kernel/base/fs/direct-io.c b/Kernel/base/fs/direct-io.c
+index 434cffcc0..43cadeeab 100644
+--- a/Kernel/base/fs/direct-io.c
++++ b/Kernel/base/fs/direct-io.c
+@@ -464,6 +464,11 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
+ 	unsigned long flags;
+ 
+ 	bio->bi_private = dio;
++#ifdef CONFIG_NVME_BG
++	// direct IO 提交时标记
++	bio->bg_id = current->bg_id;
++	bio->bg_deadline = current->bg_deadline;
++#endif /* CONFIG_NVME_BG */
+ 
+ 	spin_lock_irqsave(&dio->bio_lock, flags);
+ 	dio->refcount++;
+diff --git a/Kernel/base/fs/io_uring.c b/Kernel/base/fs/io_uring.c
+index 478df7e10..5867f574c 100644
+--- a/Kernel/base/fs/io_uring.c
++++ b/Kernel/base/fs/io_uring.c
+@@ -2116,6 +2116,10 @@ static int __io_submit_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ 	if (unlikely(s->index >= ctx->sq_entries))
+ 		return -EINVAL;
+ 
++#ifdef CONFIG_NVME_BG
++	current->bg_id = s->sqe->bg_id;
++#endif /* CONFIG_NVME_BG */
++
+ 	switch (req->submit.opcode) {
+ 	case IORING_OP_NOP:
+ 		ret = io_nop(req, req->user_data);
+@@ -3310,7 +3314,8 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
+ 							"io_uring-sq");
+ 		} else {
+ 			ctx->sqo_thread = kthread_create(io_sq_thread, ctx,
+-							"io_uring-sq");
++							"%s-io_uring-sq",
++							current->comm);
+ 		}
+ 		if (IS_ERR(ctx->sqo_thread)) {
+ 			ret = PTR_ERR(ctx->sqo_thread);
+diff --git a/Kernel/base/include/linux/blk_types.h b/Kernel/base/include/linux/blk_types.h
+index d688b96d1..431ebbac7 100644
+--- a/Kernel/base/include/linux/blk_types.h
++++ b/Kernel/base/include/linux/blk_types.h
+@@ -151,6 +151,10 @@ struct bio {
+ 	unsigned short		bi_flags;	/* status, etc and bvec pool number */
+ 	unsigned short		bi_ioprio;
+ 	unsigned short		bi_write_hint;
++#ifdef CONFIG_NVME_BG
++	unsigned int		bg_id;
++	unsigned int		bg_deadline;
++#endif /* CONFIG_NVME_BG */
+ 	blk_status_t		bi_status;
+ 	u8			bi_partno;
+ 
+diff --git a/Kernel/base/include/linux/blkdev.h b/Kernel/base/include/linux/blkdev.h
+index d5338b9ee..13d11dd9e 100644
+--- a/Kernel/base/include/linux/blkdev.h
++++ b/Kernel/base/include/linux/blkdev.h
+@@ -139,6 +139,10 @@ struct request {
+ 
+ 	int tag;
+ 	int internal_tag;
++#ifdef CONFIG_NVME_BG
++	unsigned int bg_id;
++	unsigned int bg_deadline;
++#endif /* CONFIG_NVME_BG */
+ 
+ 	/* the following two fields are internal, NEVER access directly */
+ 	unsigned int __data_len;	/* total data len */
+diff --git a/Kernel/base/include/linux/nvme.h b/Kernel/base/include/linux/nvme.h
+index a260cd754..090936305 100644
+--- a/Kernel/base/include/linux/nvme.h
++++ b/Kernel/base/include/linux/nvme.h
+@@ -816,6 +816,9 @@ enum nvme_admin_opcode {
+ 	nvme_admin_security_recv	= 0x82,
+ 	nvme_admin_sanitize_nvm		= 0x84,
+ 	nvme_admin_get_lba_status	= 0x86,
++#ifdef CONFIG_NVME_BG
++	nvme_admin_bg_deadline		= 0xe1,
++#endif /* CONFIG_NVME_BG */
+ };
+ 
+ #define nvme_admin_opcode_name(opcode)	{ opcode, #opcode }
+diff --git a/Kernel/base/include/linux/sched.h b/Kernel/base/include/linux/sched.h
+index 5710b80f8..81311608a 100644
+--- a/Kernel/base/include/linux/sched.h
++++ b/Kernel/base/include/linux/sched.h
+@@ -1268,6 +1268,12 @@ struct task_struct {
+ 	unsigned long			prev_lowest_stack;
+ #endif
+ 
++#ifdef CONFIG_NVME_BG
++	unsigned int			bg_id;
++	unsigned int			bg_deadline;
++	char				*bg_desc;
++#endif /* CONFIG_NVME_BG */
++
+ 	/*
+ 	 * New fields for task_struct should be added above here, so that
+ 	 * they are included in the randomized portion of task_struct.
+diff --git a/Kernel/base/include/linux/syscalls.h b/Kernel/base/include/linux/syscalls.h
+index f7c561c4d..387fd9cae 100644
+--- a/Kernel/base/include/linux/syscalls.h
++++ b/Kernel/base/include/linux/syscalls.h
+@@ -321,6 +321,8 @@ asmlinkage long sys_io_uring_enter(unsigned int fd, u32 to_submit,
+ 				const sigset_t __user *sig, size_t sigsz);
+ asmlinkage long sys_io_uring_register(unsigned int fd, unsigned int op,
+ 				void __user *arg, unsigned int nr_args);
++asmlinkage long sys_nvme_bg_setup(unsigned int opcode, unsigned int arg1,
++				char __user *arg2, unsigned int __user *arg3);
+ 
+ /* fs/xattr.c */
+ asmlinkage long sys_setxattr(const char __user *path, const char __user *name,
+diff --git a/Kernel/base/include/uapi/asm-generic/unistd.h b/Kernel/base/include/uapi/asm-generic/unistd.h
+index 1fc8faa6e..06623c8b1 100644
+--- a/Kernel/base/include/uapi/asm-generic/unistd.h
++++ b/Kernel/base/include/uapi/asm-generic/unistd.h
+@@ -850,9 +850,11 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+ #define __NR_clone3 435
+ __SYSCALL(__NR_clone3, sys_clone3)
+ #endif
++#define __NR_nvme_bg_setup 436
++__SYSCALL(__NR_nvme_bg_setup, sys_nvme_bg_setup)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 436
++#define __NR_syscalls 437
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/Kernel/base/include/uapi/linux/io_uring.h b/Kernel/base/include/uapi/linux/io_uring.h
+index ea57526a5..87ffcfc4f 100644
+--- a/Kernel/base/include/uapi/linux/io_uring.h
++++ b/Kernel/base/include/uapi/linux/io_uring.h
+@@ -34,6 +34,13 @@ struct io_uring_sqe {
+ 	union {
+ 		__u16	buf_index;	/* index into fixed buffers, if used */
+ 		__u64	__pad2[3];
++#ifdef CONFIG_NVME_BG
++		struct {
++			__u64	__pad0;
++			__u32	bg_id;
++			__u32	__pad3[3];
++		};
++#endif /* CONFIG_NVME_BG */
+ 	};
+ };
+ 
+diff --git a/Kernel/base/kernel/exit.c b/Kernel/base/kernel/exit.c
+index ece64771a..2174028cb 100644
+--- a/Kernel/base/kernel/exit.c
++++ b/Kernel/base/kernel/exit.c
+@@ -84,6 +84,12 @@ static void __unhash_process(struct task_struct *p, bool group_dead)
+ 	}
+ 	list_del_rcu(&p->thread_group);
+ 	list_del_rcu(&p->thread_node);
++#ifdef CONFIG_NVME_BG
++	if (p->bg_desc) {
++		kfree(p->bg_desc);
++		p->bg_desc = NULL;
++	}
++#endif /* CONFIG_NVME_BG */
+ }
+ 
+ /*
+diff --git a/Kernel/base/kernel/fork.c b/Kernel/base/kernel/fork.c
+index 50f37d5af..97c8731b9 100644
+--- a/Kernel/base/kernel/fork.c
++++ b/Kernel/base/kernel/fork.c
+@@ -2115,6 +2115,12 @@ static __latent_entropy struct task_struct *copy_process(
+ 	INIT_LIST_HEAD(&p->thread_group);
+ 	p->task_works = NULL;
+ 
++#ifdef CONFIG_NVME_BG
++	p->bg_id = 0;
++	p->bg_deadline = 0;
++	p->bg_desc = NULL;
++#endif /* CONFIG_NVME_BG */
++
+ 	cgroup_threadgroup_change_begin(current);
+ 	/*
+ 	 * Ensure that the cgroup subsystem policies allow the new process to be
+diff --git a/Kernel/base/kernel/kthread.c b/Kernel/base/kernel/kthread.c
+index 1d4c98a19..2ff47b125 100644
+--- a/Kernel/base/kernel/kthread.c
++++ b/Kernel/base/kernel/kthread.c
+@@ -182,6 +182,7 @@ void *kthread_probe_data(struct task_struct *task)
+ 	probe_kernel_read(&data, &kthread->data, sizeof(data));
+ 	return data;
+ }
++EXPORT_SYMBOL_GPL(kthread_probe_data);
+ 
+ static void __kthread_parkme(struct kthread *self)
+ {
+diff --git a/Kernel/base/mm/util.c b/Kernel/base/mm/util.c
+index ab358c64b..4e7b6e4b1 100644
+--- a/Kernel/base/mm/util.c
++++ b/Kernel/base/mm/util.c
+@@ -906,6 +906,7 @@ int get_cmdline(struct task_struct *task, char *buffer, int buflen)
+ out:
+ 	return res;
+ }
++EXPORT_SYMBOL_GPL(get_cmdline);
+ 
+ int memcmp_pages(struct page *page1, struct page *page2)
+ {
